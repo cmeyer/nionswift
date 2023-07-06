@@ -260,7 +260,6 @@ class ItemExplorerController:
 
         self.__list_canvas_item.on_focus_changed = focus_changed
         self.scroll_area_canvas_item = CanvasItem.ScrollAreaCanvasItem(self.__list_canvas_item)
-        self.scroll_area_canvas_item.auto_resize_contents = True
         self.scroll_group_canvas_item = CanvasItem.CanvasItemComposition()
         if (wrap and direction == GridCanvasItem.Direction.Row) or (not wrap and direction == GridCanvasItem.Direction.Column):
             self.scroll_bar_canvas_item = CanvasItem.ScrollBarCanvasItem(self.scroll_area_canvas_item)
