@@ -18,6 +18,7 @@ import typing
 # third party libraries
 import numpy
 import scipy.signal
+import scipy.signal.windows
 
 # local libraries
 from nion.data import DataAndMetadata
@@ -196,8 +197,8 @@ class ProcessingHammingWindow(ProcessingBase):
         elif src_xdata and src_xdata.datum_dimension_count == 2:
             # uses outer product approach of generating 2D filter from 1D
             h, w = src_xdata.datum_dimension_shape
-            w0 = numpy.reshape(scipy.signal.hamming(w), (1, w))
-            w1 = numpy.reshape(scipy.signal.hamming(h), (h, 1))
+            w0 = numpy.reshape(scipy.signal.windows.hamming(w), (1, w))
+            w1 = numpy.reshape(scipy.signal.windows.hamming(h), (h, 1))
             return src_xdata * w0 * w1
         return None
 
