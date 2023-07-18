@@ -2492,10 +2492,6 @@ class DocumentModel(Observable.Observable, ReferenceCounting.ReferenceCounted, D
                 "sources": [{"name": "src", "label": _("Source"), "croppable": True}]}
             vs["laplace"] = {"title": _("Laplace"), "expression": "xd.laplace({src}.cropped_display_xdata)",
                 "sources": [{"name": "src", "label": _("Source"), "croppable": True}]}
-            sigma_param = {"name": "sigma", "label": _("Sigma"), "type": "real", "value": 3, "value_default": 3, "value_min": 0, "value_max": 100,
-                "control_type": "slider"}
-            vs["gaussian-blur"] = {"title": _("Gaussian Blur"), "expression": "xd.gaussian_blur({src}.cropped_display_xdata, sigma)",
-                "sources": [{"name": "src", "label": _("Source"), "croppable": True}], "parameters": [sigma_param]}
             filter_size_param = {"name": "filter_size", "label": _("Size"), "type": "integral", "value": 3, "value_default": 3, "value_min": 1, "value_max": 100}
             vs["median-filter"] = {"title": _("Median Filter"), "expression": "xd.median_filter({src}.cropped_display_xdata, filter_size)",
                 "sources": [{"name": "src", "label": _("Source"), "croppable": True}], "parameters": [filter_size_param]}

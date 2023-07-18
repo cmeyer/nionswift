@@ -141,6 +141,26 @@ class ProcessingIFFT(ProcessingBase):
         return xd.ifft(src_xdata) if src_xdata else None
 
 
+class ProcessingGaussian(ProcessingBase):
+    def __init__(self, **kwargs: typing.Any) -> None:
+        super().__init__()
+        self.processing_id = "gaussian-blur"
+        self.title = _("Gaussian Blur")
+        self.sections = {"filters"}
+        self.sources = [
+            {"name": "src", "label": _("Source"), "croppable": True, "requirements": [{"type": "datum_rank", "values": (1, 2)}]},
+        ]
+        self.parameters = [
+            {"name": "sigma", "label": _("Sigma"), "type": "real", "value": 3, "value_default": 3, "value_min": 0, "value_max": 100, "control_type": "slider"}
+        ]
+        self.is_mappable = True
+
+    def process(self, *, src: Symbolic.DataSource, **kwargs: typing.Any) -> _ProcessingResult:
+        cropped_display_xdata = src.cropped_display_xdata
+        sigma = kwargs.get("sigma", 3.0)
+        return xd.gaussian_blur(cropped_display_xdata, sigma) if cropped_display_xdata else None
+
+
 class ProcessingGaussianWindow(ProcessingBase):
     def __init__(self, **kwargs: typing.Any) -> None:
         super().__init__()
@@ -272,6 +292,7 @@ class ProcessingMappedAverage(ProcessingBase):
 
 # Registry.register_component(ProcessingFFT(), {"processing-component"})
 # Registry.register_component(ProcessingIFFT(), {"processing-component"})
+Registry.register_component(ProcessingGaussian(), {"processing-component"})
 Registry.register_component(ProcessingGaussianWindow(), {"processing-component"})
 Registry.register_component(ProcessingHammingWindow(), {"processing-component"})
 Registry.register_component(ProcessingHannWindow(), {"processing-component"})
