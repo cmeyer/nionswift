@@ -5176,19 +5176,6 @@ class RebinAction(ProcessingAction):
         return self.invoke_processing(context, context.model.get_rebin_new)
 
 
-class ResampleAction(ProcessingAction):
-    action_id = "processing.resample"
-    action_name = _("Resample")
-
-    def execute(self, context: Window.ActionContext) -> Window.ActionResult:
-        context = typing.cast(DocumentController.ActionContext, context)
-        return self.execute_processing(context, context.model.get_resample_new)
-
-    def invoke(self, context: Window.ActionContext) -> Window.ActionResult:
-        context = typing.cast(DocumentController.ActionContext, context)
-        return self.invoke_processing(context, context.model.get_resample_new)
-
-
 class ResizeAction(ProcessingAction):
     action_id = "processing.resize"
     action_name = _("Resize")
@@ -5494,7 +5481,6 @@ Window.register_action(PowerSpectrumAction())
 Window.register_action(ProjectionSumAction())
 Window.register_action(RadialProfileAction())
 Window.register_action(RebinAction())
-Window.register_action(ResampleAction())
 Window.register_action(ResizeAction())
 Window.register_action(RGBAction())
 Window.register_action(RotateLeftAction())
