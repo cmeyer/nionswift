@@ -161,6 +161,28 @@ class ProcessingGaussian(ProcessingBase):
         return xd.gaussian_blur(cropped_display_xdata, sigma) if cropped_display_xdata else None
 
 
+class ProcessingResample(ProcessingBase):
+    def __init__(self, **kwargs: typing.Any) -> None:
+        super().__init__()
+        self.processing_id = "resample"
+        self.title = _("Resample")
+        self.sections = {"transforms"}
+        self.sources = [
+            {"name": "src", "label": _("Source"), "croppable": True, "requirements": [{"type": "datum_rank", "values": (1, 2)}]},
+        ]
+        self.parameters = [
+            {"name": "width", "label": _("Width"), "type": "integral", "value": 256, "value_default": 256, "value_min": 1},
+            {"name": "height", "label": _("Height"), "type": "integral", "value": 256, "value_default": 256, "value_min": 1},
+        ]
+        self.is_mappable = True
+
+    def process(self, *, src: Symbolic.DataSource, **kwargs: typing.Any) -> _ProcessingResult:
+        cropped_display_xdata = src.cropped_display_xdata
+        width = kwargs.get("width", 256)
+        height = kwargs.get("height", 256)
+        return xd.resample_image(cropped_display_xdata, (height, width)) if cropped_display_xdata else None
+
+
 class ProcessingGaussianWindow(ProcessingBase):
     def __init__(self, **kwargs: typing.Any) -> None:
         super().__init__()
@@ -293,6 +315,7 @@ class ProcessingMappedAverage(ProcessingBase):
 # Registry.register_component(ProcessingFFT(), {"processing-component"})
 # Registry.register_component(ProcessingIFFT(), {"processing-component"})
 Registry.register_component(ProcessingGaussian(), {"processing-component"})
+Registry.register_component(ProcessingResample(), {"processing-component"})
 Registry.register_component(ProcessingGaussianWindow(), {"processing-component"})
 Registry.register_component(ProcessingHammingWindow(), {"processing-component"})
 Registry.register_component(ProcessingHannWindow(), {"processing-component"})

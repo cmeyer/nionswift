@@ -2506,8 +2506,6 @@ class DocumentModel(Observable.Observable, ReferenceCounting.ReferenceCounted, D
             height_param = {"name": "height", "label": _("Height"), "type": "integral", "value": 256, "value_default": 256, "value_min": 1}
             vs["rebin"] = {"title": _("Rebin"), "expression": "xd.rebin_image({src}.cropped_display_xdata, (height, width))",
                 "sources": [{"name": "src", "label": _("Source"), "croppable": True}], "parameters": [width_param, height_param]}
-            vs["resample"] = {"title": _("Resample"), "expression": "xd.resample_image({src}.cropped_display_xdata, (height, width))",
-                "sources": [{"name": "src", "label": _("Source"), "croppable": True}], "parameters": [width_param, height_param]}
             vs["resize"] = {"title": _("Resize"), "expression": "xd.resize({src}.cropped_display_xdata, (height, width), 'mean')",
                 "sources": [{"name": "src", "label": _("Source"), "croppable": True}], "parameters": [width_param, height_param]}
             x_binning_param = {"name": "x_binning", "label": _("X Binning"), "type": "integral", "value": 2, "value_default": 2, "value_min": 1}
