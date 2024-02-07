@@ -4956,6 +4956,10 @@ class FFTAction(ProcessingAction):
 
 
 class GaussianFilterAction(ProcessingAction):
+    # NOTE: the code in _create_menus which automatically generates action_id and places processing into appropriate
+    # menus will not work as-is since the action_id for the gaussian will be 'processing.gaussian-blur' and the
+    # action_name here is 'processing.gaussian_filter'. This will have to be reconciled at some point, perhaps requiring
+    # a special mapping or a file format update.
     action_id = "processing.gaussian_filter"
     action_name = _("Gaussian Filter")
 
