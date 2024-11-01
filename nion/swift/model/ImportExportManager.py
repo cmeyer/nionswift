@@ -738,6 +738,60 @@ class NDataImportExportHandler(ImportExportHandler):
                 os.remove(data_path)
 
 
+class HDF5ImportExportHandler(ImportExportHandler):
+
+    def __init__(self, io_handler_id: str, name: str, extensions: typing.Sequence[str]) -> None:
+        super().__init__(io_handler_id, name, extensions)
+
+    def _read_import_data(self, extension: str, file_path: pathlib.Path, project_storage_system: FileStorageSystem.ProjectStorageSystem) -> ImportData:
+        import h5py
+        storage_handlers = list[StorageHandler.StorageHandler]()
+        uuid_map = dict[uuid.UUID, uuid.UUID]()
+        items = list[FileStorageSystem.PersistentDictType]()
+        fp = h5py.File(file_path, "r")
+        if "data" in fp:
+            data_group = fp["data"]
+            for key in sorted(data_group.keys()):
+                ds = data_group[key]
+                data_item_uuid = uuid.uuid4()
+                data_item_properties = json.loads(ds.attrs["properties"])
+                data_item_data = ds
+                if "uuid" in data_item_properties:
+                    uuid_map[uuid.UUID(data_item_properties["uuid"])] = data_item_uuid
+                data_item_properties["uuid"] = str(data_item_uuid)
+                data_item_metadata = FileStorageSystem.DataItemMetadata(
+                    data_item_uuid,
+                    DateTime.utcnow(),
+                    data_item_properties.get("session_id", None),
+                    ds.nbytes > 1024 * 1024 * 16
+                )
+                storage_handler = project_storage_system._make_storage_handler(data_item_metadata)
+                storage_handler.write_data(data_item_data, data_item_metadata.created_local)
+                storage_handler.write_properties(data_item_properties, data_item_metadata.created_local)
+                storage_handlers.append(storage_handler)
+        if "index" in fp:
+            index_group = fp["index"]
+            for key in sorted(index_group.attrs.keys()):
+                items.append(json.loads(index_group.attrs[key]))
+        fp.close()
+        return ImportData(storage_handlers, uuid_map, items)
+
+    def can_write_display_item(self, display_item: DisplayItem.DisplayItem, extension: str) -> bool:
+        return any(data_item.has_data for data_item in display_item.data_items)
+
+    def write_display_item(self, display_item: DisplayItem.DisplayItem, path: pathlib.Path, extension: str) -> None:
+        import h5py
+        path.unlink(missing_ok=True)
+        fp = h5py.File(path, "a")
+        index_group = fp.create_group("index")
+        index_group.attrs["1"] = json.dumps(display_item.write_to_dict())
+        data_group = fp.create_group("data")
+        for index, data_item in enumerate(display_item.data_items):
+            ds = data_group.create_dataset(str(index), data=data_item.data)
+            ds.attrs["properties"] = json.dumps(data_item.write_to_dict())
+        fp.close()
+
+
 class NumPyImportExportHandler(ImportExportHandler):
     """A file import/export handler to read/write the npy file type.
 
@@ -799,5 +853,6 @@ ImportExportManager().register_io_handler(StandardImportExportHandler("bmp-io-ha
 ImportExportManager().register_io_handler(CSVImportExportHandler("csv-io-handler", "CSV Raw", ["csv"]))
 ImportExportManager().register_io_handler(CSV1ImportExportHandler("csv1-io-handler", "CSV 1D", ["csv"]))
 ImportExportManager().register_io_handler(NDataImportExportHandler("ndata1-io-handler", "NData 1", ["ndata1"]))
+ImportExportManager().register_io_handler(HDF5ImportExportHandler("nhdf1-io-handler", "NData HDF 1", ["nhdf1"]))
 ImportExportManager().register_io_handler(NumPyImportExportHandler("numpy-io-handler", "Raw NumPy", ["npy"]))
 ImportExportManager().register_io_handler(StandardImportExportHandler("webp-io-handler", "WebP", ["webp"]))
