@@ -8,11 +8,11 @@ import json
 import logging
 import os
 import pathlib
-import types
 import typing
 import uuid
 
 # local libraries
+from nion.swift import DocumentController
 from nion.swift.model import Cache
 from nion.swift.model import Changes
 from nion.swift.model import DocumentModel
@@ -22,6 +22,7 @@ from nion.swift.model import Observer
 from nion.swift.model import Persistence
 from nion.swift.model import Project
 from nion.swift.model import Schema
+from nion.ui import Window
 from nion.utils import Converter
 
 _ = gettext.gettext
@@ -440,6 +441,140 @@ def script_item_factory(lookup_id: typing.Callable[[str], str]) -> typing.Option
     return None
 
 
+class Action(Schema.Entity):
+    def __init__(self, entity_type: Schema.EntityType = Model.Action, context: typing.Optional[Schema.EntityContext] = None, action_id: typing.Optional[str] = None) -> None:
+        super().__init__(entity_type, context)
+        self.persistent_storage: typing.Optional[Persistence.PersistentStorageInterface] = None
+        if action_id:
+            self.action_id = action_id
+
+    @property
+    def parameters(self) -> dict[str, typing.Any]:
+        return dict()
+
+    # standard overrides from entity to fit within persistent object architecture
+
+    def _field_value_changed(self, name: str, value: typing.Any) -> None:
+        # this is called when a property changes. to be compatible with the older
+        # persistent object structure, check if persistent storage exists and pass
+        # the message along to persistent storage.
+        persistent_storage = typing.cast(Persistence.PersistentStorageInterface, getattr(self, "persistent_storage", None))
+        if persistent_storage:
+            if value is not None:
+                persistent_storage.set_property(typing.cast(Persistence.PersistentObject, self), name, value)
+            else:
+                persistent_storage.clear_property(typing.cast(Persistence.PersistentObject, self), name)
+
+
+class RunScriptAction(Action):
+    def __init__(self, script_path: typing.Optional[pathlib.Path] = None) -> None:
+        super().__init__(Model.RunScriptAction, action_id="window.open_run_scripts")
+        if script_path:
+            self.script_path = script_path
+
+    @property
+    def parameters(self) -> dict[str, typing.Any]:
+        return {"script_path": str(self.script_path)}
+
+    @property
+    def script_path(self) -> typing.Optional[pathlib.Path]:
+        path_str = self._get_field_value("script_path")
+        if path_str:
+            return pathlib.Path(path_str)
+        return None
+
+    @script_path.setter
+    def script_path(self, value: typing.Optional[pathlib.Path]) -> None:
+        self._set_field_value("script_path", value)
+
+
+def action_factory(entity_type: Schema.EntityType, context: typing.Optional[Schema.EntityContext]) -> typing.Optional[Schema.Entity]:
+    if entity_type.entity_id == Model.RunScriptAction.entity_id:
+        return RunScriptAction()
+    return Action()
+
+
+Schema.register_entity_factory(Model.Action, action_factory)
+
+
+class ActionCommand(Schema.Entity):
+    # an action command, describes how to present and construct an action.
+
+    title = Schema.EntityAttribute[typing.Optional[str]]()
+    tool_tip = Schema.EntityAttribute[typing.Optional[str]]()
+    actions = Schema.EntityAttribute[typing.Sequence[Action]]()
+
+    def __init__(self, *, actions: typing.Optional[typing.Sequence[Action]] = None) -> None:
+        super().__init__(Model.ActionCommand)
+        self.persistent_storage: typing.Optional[Persistence.PersistentStorageInterface] = None
+        for index, action in enumerate(actions or list()):
+            self._insert_item("actions", index, action)
+
+    def _create(self, context: typing.Optional[Schema.EntityContext]) -> Schema.Entity:
+        action_command = ActionCommand()
+        if context:
+            action_command._set_entity_context(context)
+        return action_command
+
+    def insert_action(self, before_index: int, action: Action) -> None:
+        self._insert_item("actions", before_index, action)
+
+    def append_action(self, action: Action) -> None:
+        self._append_item("actions", action)
+
+    def remove_action(self, index_or_action: typing.Union[int, Action]) -> None:
+        if isinstance(index_or_action, Action):
+            action = index_or_action
+        else:
+            action = self.actions[index_or_action]
+        self._remove_item("actions", action)
+
+    def perform(self, document_controller: DocumentController.DocumentController) -> None:
+        actions = self.actions
+        for action in actions:
+            action_id = action.action_id
+            parameters = action.parameters
+            window_action = Window.actions.get(action_id)
+            if window_action:
+                action_context = document_controller._get_action_context()
+                if parameters:
+                    action_context.parameters = dict(parameters)
+                document_controller.perform_action_in_context(window_action, action_context)
+
+    @property
+    def window_action(self) -> typing.Optional[Window.Action]:
+        if self.actions:
+            return Window.actions.get(self.actions[0].action_id)
+        return None
+
+    # standard overrides from entity to fit within persistent object architecture
+
+    def _field_value_changed(self, name: str, value: typing.Any) -> None:
+        # this is called when a property changes. to be compatible with the older
+        # persistent object structure, check if persistent storage exists and pass
+        # the message along to persistent storage.
+        persistent_storage = typing.cast(Persistence.PersistentStorageInterface, getattr(self, "persistent_storage", None))
+        if persistent_storage:
+            if value is not None:
+                persistent_storage.set_property(typing.cast(Persistence.PersistentObject, self), name, value)
+            else:
+                persistent_storage.clear_property(typing.cast(Persistence.PersistentObject, self), name)
+
+    def _item_inserted(self, name: str, index: int, item: typing.Any) -> None:
+        persistent_storage = typing.cast(Persistence.PersistentStorageInterface, getattr(self, "persistent_storage", None))
+        if persistent_storage:
+            persistent_storage.insert_relationship_item(typing.cast(Persistence.PersistentObject, self), name, index, item)
+
+    def _item_removed(self, name: str, index: int, item: typing.Any) -> None:
+        persistent_storage = typing.cast(Persistence.PersistentStorageInterface, getattr(self, "persistent_storage", None))
+        if persistent_storage:
+            persistent_storage.remove_relationship_item(typing.cast(Persistence.PersistentObject, self), name, index, item)
+
+
+def action_command_factory(lookup_id: typing.Callable[[str], str]) -> typing.Optional[ActionCommand]:
+    return ActionCommand()
+
+
 class Profile(Persistence.PersistentObject):
     count = 0  # useful for detecting leaks in tests
 
@@ -462,6 +597,7 @@ class Profile(Persistence.PersistentObject):
         self.define_relationship("script_items", typing.cast(
             typing.Callable[[typing.Callable[[str], str]], typing.Optional[Persistence.PersistentObject]],
             script_item_factory), hidden=True)
+        self.define_relationship("action_commands", typing.cast(Persistence._PersistentObjectFactoryFn, action_command_factory), insert=self.__insert_action_command, remove=self.__remove_action_command, hidden=True)
 
         # ensure a storage system; use a memory based storage as a fallback (for testing).
         self.storage_system = storage_system or FileStorageSystem.make_memory_persistent_storage_system()
@@ -695,3 +831,26 @@ class Profile(Persistence.PersistentObject):
             self.remove_project_reference(project_reference)
             return self.add_project_reference(new_project_reference, load=False)
         return None
+
+    def __insert_action_command(self, name: str, before_index: int, action_command: ActionCommand) -> None:
+        self.notify_insert_item("action_commands", action_command, before_index)
+
+    def __remove_action_command(self, name: str, index: int, action_command: ActionCommand) -> None:
+        self.notify_remove_item("action_commands", action_command, index)
+
+    @property
+    def action_commands(self) -> typing.Sequence[ActionCommand]:
+        return typing.cast(typing.Sequence[ActionCommand], self._get_relationship_values("action_commands"))
+
+    def insert_action_command(self, before_index: int, action_command: ActionCommand) -> None:
+        self.insert_model_item(self, "action_commands", before_index, typing.cast(Persistence.PersistentObject, action_command))
+
+    def remove_action_command(self, index_or_action_command: typing.Union[int, ActionCommand], *, safe: bool = False) -> Changes.UndeleteLog:
+        if isinstance(index_or_action_command, ActionCommand):
+            action_command = index_or_action_command
+        else:
+            action_command = self.action_commands[index_or_action_command]
+        return self.remove_model_item(self, "action_commands", typing.cast(Persistence.PersistentObject, action_command), safe=safe)
+
+    def append_action_command(self, action_command: ActionCommand) -> None:
+        self.insert_action_command(len(self.action_commands), action_command)

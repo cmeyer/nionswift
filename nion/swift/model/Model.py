@@ -465,6 +465,18 @@ FolderScriptItem = Schema.entity("folder_script_item", ScriptItem, None, {
     "is_closed": Schema.prop(Schema.BOOLEAN),
 })
 
+Action = Schema.entity("action", None, None, {"action_id": Schema.prop(Schema.STRING)})
+
+RunScriptAction = Schema.entity("run_script_action", Action, None, {
+    "script_path": Schema.prop(Schema.PATH)
+})
+
+ActionCommand = Schema.entity("action_command", None, None, {
+    "title": Schema.prop(Schema.STRING, Schema.OPTIONAL),
+    "tool_tip": Schema.prop(Schema.STRING, Schema.OPTIONAL),
+    "actions": Schema.array(Schema.component(Action)),
+})
+
 Profile = Schema.entity("profile", None, 2, {
     "project_references": Schema.array(Schema.component(ProjectReference)),
     "last_project_reference": Schema.reference(ProjectReference),
