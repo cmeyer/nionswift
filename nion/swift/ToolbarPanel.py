@@ -2,15 +2,18 @@ from __future__ import annotations
 
 # standard libraries
 import gettext
+import pathlib
 import typing
 
 # third party libraries
-# None
+import numpy
 
 # local libraries
-import numpy
 from nion.swift import DocumentController
+from nion.swift import EntityBrowser
 from nion.swift import Panel
+from nion.swift.model import Feature
+from nion.swift.model import Profile
 from nion.ui import CanvasItem
 from nion.ui import Declarative
 from nion.ui import DrawingContext
@@ -18,6 +21,7 @@ from nion.ui import UserInterface
 from nion.ui import Window
 from nion.utils import Event
 from nion.utils import Geometry
+from nion.utils import ListModel
 from nion.utils import Model
 from nion.utils import Registry
 
@@ -179,9 +183,70 @@ class WorkspaceToolbarWidget(ActionTableToolbarWidget):
         )
 
 
+class CommandsToolbarWidget(Declarative.Handler):
+    toolbar_widget_id = "nion.swift.toolbar-widget.commands"
+    toolbar_widget_title = _("Commands")
+
+    def __init__(self, *, document_controller: DocumentController.DocumentController, **kwargs: typing.Any):
+        super().__init__()
+        self.__document_controller = document_controller
+
+        app = typing.cast(typing.Any, document_controller.app)  # trick typing
+        profile: typing.Optional[Profile.Profile] = app._profile if app else None
+
+        # the profile may or may not be present, so we need to handle that case. not present during tests.
+        self.action_commands = ListModel.ObservedListModel(profile, "action_commands") if profile else ListModel.ListModel()
+
+        u = Declarative.DeclarativeUI()
+
+        self.ui_view = u.create_row(
+            u.create_row(items="action_commands.items", item_component_id="action-command-component", margin=8),
+            u.create_column(u.create_stretch(), u.create_push_button(text=_("\N{GEAR}"), style="minimal", width=24, on_clicked="add_action"), u.create_stretch()),
+            u.create_stretch()
+        )
+
+    def add_action(self, widget: UserInterface.Widget) -> None:
+        self.__document_controller.perform_action("application.open_toolbar_command_dialog")
+
+    def create_handler(self, component_id: str, container: typing.Any = None, item: typing.Any = None, **kwargs: typing.Any) -> typing.Optional[Declarative.HandlerLike]:
+        if component_id == "action-command-component":
+            action_command = typing.cast(Profile.ActionCommand, item)
+
+            u = Declarative.DeclarativeUI()
+
+            class Handler(Declarative.Handler):
+                def __init__(self, document_controller: DocumentController.DocumentController, action_command: Profile.ActionCommand) -> None:
+                    super().__init__()
+                    self.__document_controller = document_controller
+                    self.action_command = action_command
+                    self.__action_command_listener = action_command.property_changed_event.listen(self.__action_command_changed)
+                    self.ui_view = u.create_column(u.create_stretch(), u.create_push_button(text="@binding(action_command.title)", on_clicked="perform", tool_tip="@binding(tool_tip)", style="minimal"), u.create_stretch())
+
+                def __action_command_changed(self, property_name: str) -> None:
+                    if property_name == "tool_tip":
+                        self.property_changed_event.fire("tool_tip")
+
+                @property
+                def tool_tip(self) -> str:
+                    action = self.action_command.window_action
+                    tool_tip = getattr(action, "action_tool_tip", getattr(action, "action_name", _("Action")))
+                    tool_tip = self.action_command.tool_tip or tool_tip
+                    key_shortcut = Window.action_shortcuts.get(action.action_id, dict()).get("display_panel", None) if action and action.action_id else None
+                    if tool_tip and key_shortcut:
+                        tool_tip += f" ({key_shortcut})"
+                    return tool_tip
+
+                def perform(self, widget: Declarative.UIWidget) -> None:
+                    self.action_command.perform(self.__document_controller)
+
+            return Handler(self.__document_controller, action_command)
+        return None
+
+
 Registry.register_component(ToolModeToolbarWidget, {"toolbar-widget"})
 Registry.register_component(RasterZoomToolbarWidget, {"toolbar-widget"})
 Registry.register_component(WorkspaceToolbarWidget, {"toolbar-widget"})
+Registry.register_component(CommandsToolbarWidget, {"toolbar-widget"})
 
 
 class ToolbarPanel(Panel.Panel):
@@ -213,8 +278,11 @@ class ToolbarPanel(Panel.Panel):
         widget_id_list = [
             "nion.swift.toolbar-widget.tool-mode",
             "nion.swift.toolbar-widget.raster-zoom",
-            "nion.swift.toolbar-widget.workspace"
+            "nion.swift.toolbar-widget.workspace",
         ]
+
+        if Feature.FeatureManager().is_feature_enabled("feature.command_palette"):
+            widget_id_list.append("nion.swift.toolbar-widget.commands")
 
         # add the widgets.
         for widget_id in widget_id_list:
@@ -252,3 +320,162 @@ class ToolbarPanel(Panel.Panel):
         if "toolbar-widget" in component_types:
             self.__toolbar_widget_row.add_spacing(12)
             self.__toolbar_widget_row.add(Declarative.DeclarativeWidget(self.ui, self.document_controller.event_loop, component(document_controller=self.document_controller)))
+
+
+class ActionCommandHandler(Declarative.Handler):
+    def __init__(self, ui: UserInterface.UserInterface, action: Profile.Action) -> None:
+        super().__init__()
+        self.__ui = ui
+        self.action = action
+        u = Declarative.DeclarativeUI()
+        script_row = u.create_row(
+            u.create_row(
+                u.create_label(text=_("Action Id"), width=80),
+                u.create_line_edit(text="@binding(action_id)", width=360)),
+            u.create_stretch(), spacing=8)
+        self.ui_view = u.create_column(
+            u.create_row(u.create_label(text=_("Command: Generic")), u.create_stretch()),
+            script_row,
+            spacing=8)
+
+    @property
+    def action_id(self) -> typing.Optional[str]:
+        action_id = self.action.action_id
+        return str(action_id) if action_id else None
+
+    @action_id.setter
+    def action_id(self, value: typing.Optional[str]) -> None:
+        if value:
+            self.action.action_id = str(value)
+        else:
+            self.action.action_id = "application.uncommand"
+        self.notify_property_changed("action_id")
+
+
+class RunScriptActionCommandHandler(Declarative.Handler):
+    def __init__(self, ui: UserInterface.UserInterface, action: Profile.RunScriptAction) -> None:
+        super().__init__()
+        self.__ui = ui
+        self.action = action
+        u = Declarative.DeclarativeUI()
+        script_row = u.create_row(u.create_row(u.create_label(text=_("Script Path"), width=80),
+                                               u.create_line_edit(text="@binding(script_path)", width=360)),
+                                  u.create_push_button(text="...", on_clicked="handle_script_path", style="minimal"),
+                                  u.create_stretch(), spacing=8)
+        self.ui_view = u.create_column(
+            u.create_row(u.create_label(text=_("Command: Run Script")), u.create_stretch()),
+            script_row,
+            spacing=8
+        )
+
+    @property
+    def script_path(self) -> typing.Optional[str]:
+        script_path = self.action.script_path
+        return str(script_path) if script_path else None
+
+    @script_path.setter
+    def script_path(self, value: typing.Optional[str]) -> None:
+        if value:
+            self.action.script_path = pathlib.Path(value)
+        else:
+            self.action.script_path = None
+        self.notify_property_changed("script_path")
+
+    def handle_script_path(self, widget: UserInterface.Widget) -> None:
+        ui = self.__ui
+        PERSISTENT_DIRECTORY_KEY = "script_commands_dir"
+        filter_str = "Scripts (*.py);;All Files (*.*)"
+        import_dir = ui.get_persistent_string(PERSISTENT_DIRECTORY_KEY, ui.get_document_location())
+        paths, selected_filter, selected_directory = ui.get_file_paths_dialog(_("Script Path"), import_dir, filter_str)
+        if len(paths) == 1:
+            ui.set_persistent_string(PERSISTENT_DIRECTORY_KEY, selected_directory)
+            path = pathlib.Path(paths[0])
+            self.script_path = str(path)
+
+
+class ToolbarCommandDetailHandler(Declarative.Handler):
+    # a master-detail for each top level item
+
+    def __init__(self, action_command: Profile.ActionCommand, ui: UserInterface.UserInterface) -> None:
+        super().__init__()
+        self.action_command = action_command
+        self.__ui = ui
+        u = Declarative.DeclarativeUI()
+        self.ui_view = u.create_column(
+            u.create_row(u.create_label(text=_("Title"), width=80),
+                         u.create_line_edit(text="@binding(action_command.title)", width=100), u.create_stretch()),
+            u.create_row(u.create_label(text=_("Hint"), width=80),
+                         u.create_line_edit(text="@binding(action_command.tool_tip)", width=240), u.create_stretch()),
+            u.create_column(items="action_command.actions", item_component_id="action", spacing=8),
+            # disabled until developed further
+            # u.create_row(u.create_push_button(text=_("Add Run Script"), on_clicked="add_run_script_action", style="minimal"),
+            #              u.create_push_button(text=_("Add Action by Id"), on_clicked="add_action", style="minimal")
+            #              ),
+            u.create_stretch(),
+            spacing=8,
+            width=480
+        )
+
+    def add_run_script_action(self, widget: UserInterface.Widget) -> None:
+        self.action_command.append_action(Profile.RunScriptAction())
+
+    def add_action(self, widget: UserInterface.Widget) -> None:
+        self.action_command.append_action(Profile.Action())
+
+    def create_handler(self, component_id: str, container: typing.Any = None, item: typing.Any = None,
+                       **kwargs: typing.Any) -> typing.Optional[Declarative.HandlerLike]:
+        if component_id == "action":
+            if isinstance(item, Profile.RunScriptAction):
+                return RunScriptActionCommandHandler(self.__ui, item)
+            else:
+                return ActionCommandHandler(self.__ui, typing.cast(Profile.Action, item))
+        return None
+
+
+class ToolbarCommandDialog(Declarative.WindowHandler):
+    def __init__(self, document_controller: DocumentController.DocumentController, profile: Profile.Profile) -> None:
+        super().__init__()
+        self.__document_controller = document_controller
+        self.__profile = profile
+        self.dialog_id = "toolbar-command-dialog"
+        u = Declarative.DeclarativeUI()
+
+        action_commands = ListModel.FilteredListModel(container=ListModel.ObservedListModel(profile, "action_commands"))
+
+        def add_item() -> None:
+            action_command = Profile.ActionCommand(actions=[Profile.RunScriptAction()])
+            action_command.title = _("New Command")
+            action_command.tool_tip = _("New command hint.")
+            self.__profile.append_action_command(action_command)
+
+        def remove_item(item: typing.Any) -> None:
+            action_command = typing.cast(Profile.ActionCommand, item)
+            self.__profile.remove_action_command(action_command)
+
+        def make_component(item: typing.Any) -> typing.Optional[Declarative.HandlerLike]:
+            return ToolbarCommandDetailHandler(item, document_controller.ui)
+
+        list_props = {"width": 160, "min_height": 360}
+        self.__md_browser = EntityBrowser.MasterDetailHandler(action_commands, "items", typing.cast(EntityBrowser.DynamicWidgetConstructorFn, make_component), "title", None, list_props, add_item_fn=add_item, remove_item_fn=remove_item)
+
+        content = u.create_column(u.create_component_instance(identifier="content"), u.create_stretch())
+
+        window = u.create_window(content, title=_("Toolbar Commands"), margin=12, window_style="tool")
+        self.run(window, parent_window=document_controller, persistent_id=self.dialog_id)
+        self.__document_controller.register_dialog(self.window)
+
+    def close(self) -> None:
+        setattr(self.__document_controller, f"_{self.dialog_id}_dialog", None)
+        super().close()
+
+    def create_handler(self, component_id: str, container: typing.Any = None, item: typing.Any = None, **kwargs: typing.Any) -> typing.Optional[Declarative.HandlerLike]:
+        if component_id == "content":
+            return self.__md_browser
+        return None
+
+
+def open_toolbar_command_dialog(document_controller: DocumentController.DocumentController, profile: Profile.Profile) -> None:
+    ToolbarCommandDialog(document_controller, profile)
+
+
+Feature.FeatureManager().add_feature(Feature.Feature("feature.command_palette", "Toolbar command palette for running scripts (requires restart)"))

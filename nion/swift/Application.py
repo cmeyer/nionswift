@@ -375,6 +375,10 @@ class Application(UIApplication.BaseApplication):
         return self.__profile
 
     @property
+    def _profile(self) -> typing.Optional[Profile.Profile]:
+        return self.__profile
+
+    @property
     def document_model(self) -> DocumentModel.DocumentModel:
         assert self.__document_model
         return self.__document_model
@@ -1178,7 +1182,22 @@ class SwitchProjectAction(UIWindow.Action):
         return UIWindow.ActionResult(UIWindow.ActionStatus.FINISHED)
 
 
+class OpenToolbarCommandDialogAction(UIWindow.Action):
+    action_id = "application.open_toolbar_command_dialog"
+    action_name = _("Add Toolbar Command...")
+
+    def execute(self, context: UIWindow.ActionContext) -> UIWindow.ActionResult:
+        raise NotImplementedError()
+
+    def invoke(self, context: UIWindow.ActionContext) -> UIWindow.ActionResult:
+        application = typing.cast(Application, context.application)
+        window = typing.cast(DocumentController.DocumentController, context.window)
+        ToolbarPanel.open_toolbar_command_dialog(window, application.profile)
+        return UIWindow.ActionResult(UIWindow.ActionStatus.FINISHED)
+
+
 UIWindow.register_action(NewProjectAction())
 UIWindow.register_action(OpenProjectAction())
 UIWindow.register_action(ChooseProjectAction())
 UIWindow.register_action(SwitchProjectAction())
+UIWindow.register_action(OpenToolbarCommandDialogAction())
