@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 # standard libraries
-import dataclasses
-import enum
+import asyncio
 import gettext
-import logging
 import os
 import pathlib
 import platform
 import re
 import subprocess
-import traceback
 import typing
 import unicodedata
 
@@ -27,6 +24,7 @@ from nion.ui import Dialog
 from nion.ui import UserInterface
 from nion.utils import Converter
 from nion.utils import Geometry
+from nion.utils import ListModel
 from nion.utils import Model
 from nion.utils import Observable
 
@@ -77,7 +75,7 @@ class ExportDialog(Declarative.Handler):
         def handle_export_clicked() -> bool:
             selected_writer = self.viewmodel.writer.value
             writer_id = selected_writer.io_handler_id if selected_writer else "png-io-handler"
-            self.export_clicked(display_items, self.viewmodel, ui, document_controller)
+            self.export_clicked(document_controller, self.viewmodel, display_items)
             self.ui.set_persistent_string("export_io_handler_id", writer_id)
             return True
 
@@ -105,13 +103,13 @@ class ExportDialog(Declarative.Handler):
         writers_names = [getattr(writer, "name") for writer in self.__writers]
 
         # Export Folder
-        directory_label = u.create_row(u.create_label(text="Location:", font='bold'))
-        directory_text = u.create_row(u.create_column(u.create_label(text=f"@binding(viewmodel.directory.value)", min_width=280, height=48, word_wrap=True, size_policy_horizontal='min-expanding', text_alignment_vertical='top')))
+        directory_label = u.create_row(u.create_label(text="Location:", font="bold"))
+        directory_text = u.create_row(u.create_column(u.create_label(text=f"@binding(viewmodel.directory.value)", min_width=280, height=48, word_wrap=True, size_policy_horizontal="min-expanding", text_alignment_vertical="top")))
         self.directory_text_label = directory_text
         directory_button = u.create_row(u.create_push_button(text=_("Select Path..."), on_clicked="choose_directory"), u.create_stretch())
 
         # Filename
-        filename_label = u.create_row(u.create_label(text="Filename:", font='bold'), u.create_stretch())
+        filename_label = u.create_row(u.create_label(text="Filename:", font="bold"), u.create_stretch())
 
         # Title
         title_checkbox = u.create_row(
@@ -139,7 +137,7 @@ class ExportDialog(Declarative.Handler):
             items=writers_names,
             current_index=f"@binding(writer_index)",
             on_current_index_changed="on_writer_changed")
-        file_type_label = u.create_label(text=_("File Format:"), font='bold')
+        file_type_label = u.create_label(text=_("File Format:"), font="bold")
         file_type_row = u.create_row(file_type_combobox, u.create_stretch())
 
         # Build final ui column
@@ -195,48 +193,42 @@ class ExportDialog(Declarative.Handler):
         return test_filepath
 
     @staticmethod
-    def export_clicked(display_items: typing.Sequence[DisplayItem.DisplayItem], viewmodel: ExportDialogViewModel,
-                       ui: UserInterface.UserInterface, document_controller: DocumentController.DocumentController) -> None:
+    def export_clicked(document_controller: DocumentController.DocumentController, viewmodel: ExportDialogViewModel, display_items: typing.Sequence[DisplayItem.DisplayItem]) -> None:
         directory_path = pathlib.Path(viewmodel.directory.value or str())
         writer_model = viewmodel.writer
         writer = writer_model.value
         if directory_path.is_dir() and writer:
-            export_results = list()
+            export_items_model = ListModel.ListModel[ExportItem]()
+
+            export_items_dialog_handler = show_export_items_dialog(document_controller, export_items_model, directory_path)
+
             for index, display_item in enumerate(display_items):
                 data_item = display_item.data_item
-                file_name: str = ''
-                try:
-                    components = list()
-                    if viewmodel.prefix.value is not None and viewmodel.prefix.value != '':
-                        components.append(str(viewmodel.prefix.value))
-                    if viewmodel.include_title.value:
-                        title = unicodedata.normalize('NFKC', display_item.displayed_title)
-                        title = re.sub(r'[^\w\s-]', '', title, flags=re.U).strip()
-                        title = re.sub(r'[-\s]+', '-', title, flags=re.U)
-                        components.append(title)
-                    if viewmodel.include_date.value:
-                        # prefer the data item created date, but fall back to the display item created date.
-                        created_local = data_item.created_local if data_item else display_item.created_local
-                        components.append(created_local.isoformat().replace(':', '').replace('.', '_'))
-                    if viewmodel.include_dimensions.value and data_item:
-                        components.append("x".join([str(shape_n) for shape_n in data_item.dimensional_shape]))
-                    if viewmodel.include_sequence.value:
-                        components.append(str(index))
-                    filepath = ExportDialog.build_filepath(components, writer.extensions[0], directory_path=directory_path)
-                    file_extension = filepath.suffix[1:].lower()
-                    if writer.can_write_display_item(display_item, file_extension):
-                        ImportExportManager.ImportExportManager().write_display_item_with_writer(writer, display_item, filepath)
-                        export_results.append(ExportResult(display_item.displayed_title))
-                    else:
-                        error_message = _("Cannot export this data to file format")
-                        export_results.append(ExportResult(display_item.displayed_title, f"{error_message} {writer.name}"))
-                except Exception as e:
-                    logging.debug("Could not export image %s / %s", str(data_item), str(e))
-                    traceback.print_exc()
-                    traceback.print_stack()
-                    export_results.append(ExportResult(file_name, str(e)))
+                components = list()
+                if viewmodel.prefix.value is not None and viewmodel.prefix.value != '':
+                    components.append(str(viewmodel.prefix.value))
+                if viewmodel.include_title.value:
+                    title = unicodedata.normalize('NFKC', display_item.displayed_title)
+                    title = re.sub(r'[^\w\s-]', '', title, flags=re.U).strip()
+                    title = re.sub(r'[-\s]+', '-', title, flags=re.U)
+                    components.append(title)
+                if viewmodel.include_date.value:
+                    # prefer the data item created date, but fall back to the display item created date.
+                    created_local = data_item.created_local if data_item else display_item.created_local
+                    components.append(created_local.isoformat().replace(':', '').replace('.', '_'))
+                if viewmodel.include_dimensions.value and data_item:
+                    components.append("x".join([str(shape_n) for shape_n in data_item.dimensional_shape]))
+                if viewmodel.include_sequence.value:
+                    components.append(str(index))
+                filepath = ExportDialog.build_filepath(components, writer.extensions[0], directory_path=directory_path)
+                file_extension = filepath.suffix[1:].lower()
+                if writer.can_write_display_item(display_item, file_extension):
+                    export_items_model.append_item(ExportItem(writer, display_item, filepath))
+                else:
+                    error_message = _("Cannot export this data to file format")
+                    export_items_model.append_item(ExportItem(writer, display_item, filepath, f"{error_message} {writer.name}"))
 
-            ExportResultDialog(ui, document_controller, export_results, directory_path)
+            document_controller.event_loop.create_task(export_items_dialog_handler.run_export())
 
     def cancel(self) -> bool:
         return True
@@ -632,37 +624,117 @@ class ExportSVGDialog:
         return True
 
 
-@dataclasses.dataclass
-class ExportResult:
-    data_item_title: str
-    error: typing.Optional[str] = None
+class ExportItem(Observable.Observable):
+    def __init__(self, writer: ImportExportManager.ImportExportHandler, display_item: DisplayItem.DisplayItem, filepath: pathlib.Path, error: str | None = None) -> None:
+        super().__init__()
+        self.writer = writer
+        self.display_item = display_item
+        self.filepath = filepath
+        self.data_item_title = display_item.displayed_title
+        self.error: str | None = None
+        self.is_started = False
+        self.is_finished = False
+        self.is_canceled = False
+        self.__progress = 0.0
+
+    @property
+    def status_str(self) -> str:
+        if self.error:
+            return f"\N{WARNING SIGN} {self.error}"
+        match self.is_started, self.is_finished, self.is_canceled:
+            case [True, True, False]:
+                return _("Exported")
+            case [True, False, False]:
+                return _("Exporting...")
+            case [False, False, False]:
+                return _("Not started")
+            case [_, _, True]:
+                return _("Canceled")
+        return str()
+
+    @property
+    def status_str_color(self) -> str | None:
+        if self.error:
+            return "red"
+        if not self.is_started:
+            return "gray"
+        return "black"
+
+    @property
+    def is_progress_visible(self) -> bool:
+        return self.is_started and not self.is_finished and not self.is_canceled
+
+    @property
+    def is_status_text_visible(self) -> bool:
+        return not self.is_progress_visible
+
+    @property
+    def progress(self) -> int:
+        return int(self.__progress * 100)
+
+    async def export(self) -> None:
+        if not self.error:
+            self.is_started = True
+            self.notify_property_changed("status_str")
+            self.notify_property_changed("status_str_color")
+            self.notify_property_changed("is_progress_visible")
+            self.notify_property_changed("is_status_text_visible")
+            await asyncio.sleep(0.1)  # Simulate some delay for export to start
+            ImportExportManager.ImportExportManager().write_display_item_with_writer(self.writer, self.display_item, self.filepath)
+            for i in range(10):
+                self.__progress = (i + 1) / 10.0
+                self.notify_property_changed("status_str")
+                self.notify_property_changed("status_str_color")
+                self.notify_property_changed("progress")
+                await asyncio.sleep(0.1)
+            await asyncio.sleep(2.0)  # Simulate some delay for export to start
+            self.is_finished = True
+            self.notify_property_changed("status_str")
+            self.notify_property_changed("status_str_color")
+            self.notify_property_changed("is_progress_visible")
+            self.notify_property_changed("is_status_text_visible")
 
 
-class ExportResultDialog(Declarative.Handler):
-    def __init__(self, ui: UserInterface.UserInterface, document_controller: DocumentController.DocumentController,
-                 exports: typing.Sequence[ExportResult], export_folder: pathlib.Path):
+FILE_FIELD_WIDTH: typing.Final[int] = 320
+PROGRESS_BAR_WIDTH: typing.Final[int] = 160
+STATUS_FIELD_WIDTH: typing.Final[int] = 280
+COLUMN_SPACING: typing.Final[int] = 12
+
+
+class ExportResultHandler(Declarative.Handler):
+   def __init__(self, export_item: ExportItem) -> None:
+       super().__init__()
+       self.export_item = export_item
+       u = Declarative.DeclarativeUI()
+       self.ui_view = u.create_row(
+           u.create_label(text=export_item.data_item_title, tool_tip=export_item.data_item_title, width=FILE_FIELD_WIDTH),
+           u.create_row(
+                u.create_label(text="@binding(export_item.status_str)", visible="@binding(export_item.is_status_text_visible)", tool_tip="@binding(export_item.error)", color="@binding(export_item.status_str_color)", width=STATUS_FIELD_WIDTH),
+                u.create_progress_bar(value="@binding(export_item.progress)", visible="@binding(export_item.is_progress_visible)", width=PROGRESS_BAR_WIDTH),
+               u.create_stretch(),
+           ),
+           u.create_stretch(),
+           spacing=12
+       )
+
+
+class ExportResultDialogHandler(Declarative.Handler):
+    def __init__(self, document_controller: DocumentController.DocumentController, exports: ListModel.ListModel[ExportItem], export_folder: pathlib.Path) -> None:
         super().__init__()
 
-        self.ui = ui
+        self.ui = document_controller.ui
         self.__document_controller = document_controller
         self.exports = exports
         self.export_folder = export_folder
 
+        self.__is_canceled = False
+
+        self.ok_button: UserInterface.PushButtonWidget | None = None
+        self.cancel_button: UserInterface.PushButtonWidget | None = None
+
         # build the UI
         u = Declarative.DeclarativeUI()
         self._build_ui(u)
-
-        # create the dialog and show it.
-        export_result_text = _("Export Results")
-        items_text = _("Items")
-        title_text = f"{export_result_text} ({len(exports)} {items_text})"
-        dialog = typing.cast(Dialog.ActionDialog, Declarative.construct(document_controller.ui, document_controller,
-                                                                        u.create_modeless_dialog(self.ui_view,
-                                                                                                 title=title_text),
-                                                                        self))
-
-        dialog.add_button(_("OK"), self.ok_click)
-        dialog.show()
 
     def open_export_folder(self, widget: Declarative.UIWidget) -> bool:
         if platform.system() == 'Windows':
@@ -674,59 +746,68 @@ class ExportResultDialog(Declarative.Handler):
         return True
 
     def _build_ui(self, u: Declarative.DeclarativeUI) -> None:
-        FILE_FIELD_WIDTH = 320
-        STATUS_FIELD_WIDTH = 280
-        COLUMN_SPACING = 12
-
         header_labels = [
-            u.create_label(text=_('Data Item'), font='bold', width=FILE_FIELD_WIDTH),
-            u.create_label(text=_('Error'), font='bold', width=STATUS_FIELD_WIDTH),
+            u.create_label(text=_("Data Item"), font="bold", width=FILE_FIELD_WIDTH),
+            u.create_label(text=_("Result"), font="bold", width=STATUS_FIELD_WIDTH),
         ]
-
-        file_name_labels = list()
-        status_labels = list()
-
-        for export in self.exports:
-            if export.error:
-                status_text = f"\N{WARNING SIGN} {export.error}"
-                color = 'red'
-                file_name_labels.append(u.create_label(text=export.data_item_title, tool_tip=export.data_item_title, width=FILE_FIELD_WIDTH))
-                status_labels.append(u.create_label(text=status_text, tool_tip=export.error, color=color, width=STATUS_FIELD_WIDTH))
-
-        num_errors = len(file_name_labels)
-        total_exports = len(self.exports)
-        num_successful = total_exports - num_errors
-        info_row = u.create_row(u.create_label(text=f"{num_successful} of {total_exports} successful"))
 
         header_row = u.create_row(*header_labels, u.create_stretch(), spacing=COLUMN_SPACING)
 
         scroll_area_width = FILE_FIELD_WIDTH + STATUS_FIELD_WIDTH + COLUMN_SPACING * 2 + 24  # 24 is the estimated width of the scrollbar
-        scroll_area_height = min(200, 28 + 28 * len(self.exports))  # 28 is the estimated height of a row
+        scroll_area_height = min(200, 28 + 28 * 12)  # 28 is the estimated height of a row
 
         data_row = u.create_scroll_area(
-            u.create_column(
-                u.create_row(
-                    u.create_column(*file_name_labels, u.create_stretch(), spacing=8),
-                    u.create_column(*status_labels, u.create_stretch(), spacing=8),
-                    u.create_stretch(),
-                    spacing=COLUMN_SPACING
-                )
-            ),
+            u.create_column(u.create_column(items="exports.items", item_component_id="export-result", spacing=6), u.create_stretch()),
             min_width=scroll_area_width, min_height=scroll_area_height, max_height=240
         )
 
-        path_title = u.create_label(text=_('Directory:'), font='bold')
+        path_title = u.create_label(text=_("Location:"), font="bold")
 
-        path_directory = u.create_label(text=str(self.export_folder), min_width=280, word_wrap=True, size_policy_horizontal='min-expanding', text_alignment_vertical='top')
+        path_directory = u.create_label(text=str(self.export_folder), min_width=280, word_wrap=True, size_policy_horizontal="min-expanding", text_alignment_vertical="top")
 
-        path_goto = u.create_row(u.create_push_button(text='Open Directory', on_clicked='open_export_folder'),
-                                 u.create_stretch())
+        path_goto = u.create_row(u.create_push_button(text=_("Open Location"), on_clicked="open_export_folder"), u.create_stretch())
 
-        if num_errors == 0:
-            self.ui_view = u.create_column(info_row, path_title, path_directory, path_goto, spacing=8, margin=12)
-        else:
-            self.ui_view = u.create_column(info_row, path_title, path_directory, path_goto, header_row, data_row, spacing=8,
-                                           margin=12)
+        self.ui_view = u.create_column(path_title, path_directory, path_goto, header_row, data_row, spacing=8, margin=12)
+
+    def create_handler(self, component_id: str, container: typing.Any = None, item: typing.Any = None, **kwargs: typing.Any) -> typing.Optional[Declarative.HandlerLike]:
+        if component_id == "export-result":
+            assert item is not None
+            return ExportResultHandler(typing.cast(ExportItem, item))
+        return None
+
+    async def run_export(self) -> None:
+        assert self.ok_button
+        assert self.cancel_button
+        self.cancel_button.enabled = True
+        self.ok_button.enabled = False
+        for export_item in self.exports.items:
+            if not self.__is_canceled:
+                await export_item.export()
+            else:
+                export_item.is_canceled = True
+                export_item.notify_property_changed("status_str")
+        self.cancel_button.enabled = False
+        self.ok_button.enabled = True
 
     def ok_click(self) -> bool:
         return True
+
+    def cancel_click(self) -> bool:
+        self.__is_canceled = True
+        return False
+
+
+def show_export_items_dialog(document_controller: DocumentController.DocumentController, exports: ListModel.ListModel[ExportItem], export_folder: pathlib.Path) -> ExportResultDialogHandler:
+    # create the dialog and show it.
+    export_item_text = _("Export Results")
+    items_text = _("Items")
+    title_text = f"{export_item_text} ({len(exports.items)} {items_text})"
+    u = Declarative.DeclarativeUI()
+    dialog_handler = ExportResultDialogHandler(document_controller, exports, export_folder)
+    dialog = typing.cast(Dialog.ActionDialog, Declarative.construct(document_controller.ui, document_controller,
+                                                                    u.create_modeless_dialog(dialog_handler.ui_view, title=title_text),
+                                                                    dialog_handler))
+    dialog_handler.cancel_button = dialog.add_button(_("Cancel"), dialog_handler.cancel_click)
+    dialog_handler.ok_button = dialog.add_button(_("OK"), dialog_handler.ok_click)
+    dialog.show()
+    return dialog_handler
