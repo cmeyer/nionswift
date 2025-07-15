@@ -46,6 +46,7 @@ from nion.utils import Stream
 
 if typing.TYPE_CHECKING:
     from nion.swift.model import Project
+    from nion.swift.model import ImportExportManager
 
 _ImageDataType = Image._ImageDataType
 _RGBA32Type = Image._RGBAImageDataType
@@ -1650,7 +1651,6 @@ def display_data_channel_factory(lookup_id: typing.Callable[[str], str]) -> Disp
 
 class DisplayLayer(Schema.Entity):
     data_row = Schema.EntityAttribute[typing.Optional[int]]()
-    label = Schema.EntityAttribute[typing.Optional[str]]()
     stroke_color = Schema.EntityAttribute[typing.Optional[str]]()
     fill_color = Schema.EntityAttribute[typing.Optional[str]]()
     stroke_width = Schema.EntityAttribute[typing.Optional[int]]()
@@ -1701,6 +1701,33 @@ class DisplayLayer(Schema.Entity):
                 persistent_storage.set_property(typing.cast(Persistence.PersistentObject, self), name, value)
             else:
                 persistent_storage.clear_property(typing.cast(Persistence.PersistentObject, self), name)
+
+    @property
+    def data_item(self) -> DataItem.DataItem | None:
+        if display_data_channel := self.display_data_channel:
+            return display_data_channel.data_item
+        return None
+
+    @property
+    def display_data(self) -> DataAndMetadata._ImageDataType | None:
+        if display_data_and_metadata := self.display_data_and_metadata:
+            return display_data_and_metadata.data
+        return None
+
+    @property
+    def display_data_and_metadata(self) -> DataAndMetadata.DataAndMetadata | None:
+        if display_data_channel := self.display_data_channel:
+            if display_values := display_data_channel.get_latest_computed_display_values():
+                return display_values.display_data_and_metadata
+        return None
+
+    @property
+    def label(self) -> str | None:
+        return typing.cast(str | None, self._get_field_value("label"))
+
+    @label.setter
+    def label(self, value: str | None) -> None:
+        self._set_field_value("label", value)
 
 
 def display_layer_factory(lookup_id: typing.Callable[[str], str]) -> DisplayLayer:
@@ -2942,6 +2969,15 @@ class DisplayItem(Persistence.PersistentObject):
             if display_data_channel.data_item == data_item:
                 return display_data_channel
         return None
+
+    @property
+    def display_rgba_data(self) -> DataAndMetadata._ImageDataType | None:
+        # temporary method to make this compatible with the DisplayItemSnapshot protocol
+        display_data_channel = self.display_data_channel
+        assert display_data_channel
+        display_values = display_data_channel.get_latest_computed_display_values()
+        assert display_values
+        return display_values.display_rgba  # export the display rather than the data for these types
 
     def __update_displays(self) -> None:
         for display_data_channel in self.display_data_channels:

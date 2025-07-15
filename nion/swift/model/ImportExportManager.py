@@ -2,6 +2,7 @@
 import copy
 import dataclasses
 import datetime
+import gettext
 import io
 import json
 import logging
@@ -22,7 +23,6 @@ from nion.data import Calibration
 from nion.data import DataAndMetadata
 from nion.data import Image
 from nion.swift.model import DataItem
-from nion.swift.model import DisplayItem
 from nion.swift.model import FileStorageSystem
 from nion.swift.model import StorageHandler
 from nion.swift.model import Utility
@@ -32,6 +32,9 @@ from nion.utils import Registry
 
 DataElementType = typing.Dict[str, typing.Any]
 _DataArrayType = numpy.typing.NDArray[typing.Any]
+
+
+_ = gettext.gettext
 
 
 class ImportExportIncompatibleDataError(Exception):
@@ -44,6 +47,71 @@ class ImportData:
     uuid_map: typing.Mapping[uuid.UUID, uuid.UUID]
     items: typing.Sequence[DataElementType]
 
+
+class DataItemSnapshot(typing.Protocol):
+    @property
+    def uuid(self) -> uuid.UUID: ...
+
+    @property
+    def created(self) -> datetime.datetime: ...
+
+    @property
+    def data(self) -> DataAndMetadata._ImageDataType | None: ...
+
+    @property
+    def xdata(self) -> DataAndMetadata.DataAndMetadata | None: ...
+
+    @property
+    def data_metadata(self) -> DataAndMetadata.DataMetadata | None: ...
+
+    @property
+    def title(self) -> str: ...
+
+    @property
+    def source_file_path(self) -> pathlib.Path | None: ...
+
+
+class DisplayLayerSnapshot(typing.Protocol):
+    @property
+    def data_item(self) -> DataItemSnapshot | None: ...
+
+    @property
+    def display_data(self) -> DataAndMetadata._ImageDataType | None: ...
+
+    @property
+    def display_data_and_metadata(self) -> DataAndMetadata.DataAndMetadata | None: ...
+
+    @property
+    def label(self) -> str | None: ...
+
+
+class DisplayItemSnapshot(typing.Protocol):
+    @property
+    def data_items(self) -> typing.Sequence[DataItemSnapshot]: ...
+
+    @property
+    def display_layers(self) -> typing.Sequence[DisplayLayerSnapshot]: ...
+
+    @property
+    def data_item(self) -> DataItemSnapshot | None: ...
+
+    @property
+    def display_rgba_data(self) -> DataAndMetadata._ImageDataType | None: ...
+
+
+"""
+class DisplayLayerSnapshotX:
+    @property
+    def display_data_and_metadata(self) -> DataAndMetadata.DataAndMetadata | None: ...
+        display_data_channel = display_item.get_display_layer_display_data_channel(index)
+        assert display_data_channel
+        display_values = display_data_channel.get_latest_computed_display_values()
+        assert display_values
+        xdata = display_values.display_data_and_metadata
+
+            label = display_layer.label or display_item.get_display_layer_property(index, "label") or f"Data {index}"
+
+"""
 
 class ImportExportHandler:
 
@@ -113,12 +181,12 @@ class ImportExportHandler:
     def can_write(self, data_metadata: DataAndMetadata.DataMetadata, extension: str) -> bool:
         return False
 
-    def can_write_display_item(self, display_item: DisplayItem.DisplayItem, extension: str) -> bool:
+    def can_write_display_item(self, display_item: DisplayItemSnapshot, extension: str) -> bool:
         data_item = display_item.data_item
         data_metadata = data_item.data_metadata if data_item else None
         return data_metadata is not None and self.can_write(data_metadata, extension)
 
-    def write_display_item(self, display_item: DisplayItem.DisplayItem, path: pathlib.Path, extension: str) -> None:
+    def write_display_item(self, display_item: DisplayItemSnapshot, path: pathlib.Path, extension: str) -> None:
         data_item = display_item.data_item
         assert data_item
         with open(path, 'wb') as f:
@@ -165,7 +233,7 @@ class ImportExportManager(metaclass=Utility.Singleton):
                 return io_handler
         return None
 
-    def get_writers_for_display_item(self, display_item: DisplayItem.DisplayItem) -> typing.Sequence[ImportExportHandler]:
+    def get_writers_for_display_item(self, display_item: DisplayItemSnapshot) -> typing.Sequence[ImportExportHandler]:
         writers = []
         for io_handler in self.__io_handlers:
             for extension in io_handler.extensions:
@@ -193,7 +261,7 @@ class ImportExportManager(metaclass=Utility.Singleton):
             return data_items[0].data if data_items else None
         return None
 
-    def write_display_item_with_writer(self, writer: ImportExportHandler, display_item: DisplayItem.DisplayItem, path: pathlib.Path) -> None:
+    def write_display_item_with_writer(self, writer: ImportExportHandler, display_item: DisplayItemSnapshot, path: pathlib.Path) -> None:
         extension = path.suffix
         if extension:
             extension = extension[1:].lower()  # remove the leading "."
@@ -201,11 +269,15 @@ class ImportExportManager(metaclass=Utility.Singleton):
                 start = time.time()
                 writer.write_display_item(display_item, path, extension)
                 elapsed = time.time() - start
-                export_metrics_str = f"{int(elapsed)}s ({path}) {'/'.join(data_item.size_and_data_format_as_string for data_item in display_item.data_items)}"
+                def size_and_data_format_as_string(data_item: DataItemSnapshot) -> str:
+                    if data_metadata := data_item.data_metadata:
+                        return data_metadata.size_and_data_format_as_string
+                    return _("No Data")
+                export_metrics_str = f"{int(elapsed)}s ({path}) {'/'.join(size_and_data_format_as_string(data_item) for data_item in display_item.data_items)}"
                 logging.getLogger("export").info(f"Export {export_metrics_str}")
                 logging.getLogger("_commands").info(f"# export metrics {export_metrics_str}")
 
-    def write_display_item(self, display_item: DisplayItem.DisplayItem, path: pathlib.Path) -> None:
+    def write_display_item(self, display_item: DisplayItemSnapshot, path: pathlib.Path) -> None:
         extension = path.suffix
         if extension:
             extension = extension[1:].lower()  # remove the leading "."
@@ -417,36 +489,36 @@ def convert_data_element_to_data_and_metadata_1(data_element: DataElementType) -
                                                  timezone_offset=tz_value)
 
 
-def create_data_element_from_data_item(data_item: DataItem.DataItem, include_data: bool = True) -> DataElementType:
+def create_data_element_from_data_item(data_item: DataItemSnapshot, include_data: bool = True) -> DataElementType:
     data_element: DataElementType = dict()
     data_element["version"] = 1
     data_element["reader_version"] = 1
-    if data_item.has_data:
-        data_element["large_format"] = bool(data_item.large_format)
+    data_metadata = data_item.data_metadata
+    if data_metadata:
         if include_data:
             data_element["data"] = data_item.data
-        dimensional_calibrations = data_item.dimensional_calibrations
+        dimensional_calibrations = data_metadata.dimensional_calibrations
         if dimensional_calibrations is not None:
             calibrations_element = list()
             for calibration in dimensional_calibrations:
                 calibration_element = { "offset": calibration.offset, "scale": calibration.scale, "units": calibration.units }
                 calibrations_element.append(calibration_element)
             data_element["spatial_calibrations"] = calibrations_element
-        intensity_calibration = data_item.intensity_calibration
+        intensity_calibration = data_metadata.intensity_calibration
         if intensity_calibration is not None:
             intensity_calibration_element = { "offset": intensity_calibration.offset, "scale": intensity_calibration.scale, "units": intensity_calibration.units }
             data_element["intensity_calibration"] = intensity_calibration_element
-        if data_item.is_sequence:
-            data_element["is_sequence"] = data_item.is_sequence
-        data_element["collection_dimension_count"] = data_item.collection_dimension_count
-        data_element["datum_dimension_count"] = data_item.datum_dimension_count
-        data_item_metadata = data_item.metadata or dict()
+        if data_metadata.is_sequence:
+            data_element["is_sequence"] = data_metadata.is_sequence
+        data_element["collection_dimension_count"] = data_metadata.collection_dimension_count
+        data_element["datum_dimension_count"] = data_metadata.datum_dimension_count
+        data_item_metadata = data_metadata.metadata or dict()
         data_element["metadata"] = copy.deepcopy(data_item_metadata)
         data_element["properties"] = copy.deepcopy(data_item_metadata.get("hardware_source", dict()))
         data_element["title"] = data_item.title
         data_element["source_file_path"] = data_item.source_file_path.as_posix() if data_item.source_file_path else None
-        tz_value = data_item.timezone_offset
-        timezone = data_item.timezone
+        tz_value = data_metadata.timezone_offset
+        timezone = data_metadata.timezone
         dst_minutes = None
         time_zone_dict = data_item_metadata.get("description", dict()).get("time_zone")
         if time_zone_dict:
@@ -593,14 +665,10 @@ class StandardImportExportHandler(ImportExportHandler):
     def can_write(self, data_metadata: DataAndMetadata.DataMetadata, extension: str) -> bool:
         return len(data_metadata.dimensional_shape) == 2
 
-    def write_display_item(self, display_item: DisplayItem.DisplayItem, path: pathlib.Path, extension: str) -> None:
-        display_data_channel = display_item.display_data_channel
-        assert display_data_channel
-        display_values = display_data_channel.get_latest_computed_display_values()
-        assert display_values
-        data = display_values.display_rgba  # export the display rather than the data for these types
-        assert data is not None
-        imageio.imwrite(path, numpy.flip(Image.get_rgb_view(data), 2), extension="." + extension)
+    def write_display_item(self, display_item: DisplayItemSnapshot, path: pathlib.Path, extension: str) -> None:
+        display_rgba_data = display_item.display_rgba_data  # export the display rather than the data for these types
+        assert display_rgba_data is not None
+        imageio.imwrite(path, numpy.flip(Image.get_rgb_view(display_rgba_data), 2), extension="." + extension)
 
 
 class CSVImportExportHandler(ImportExportHandler):
@@ -619,7 +687,7 @@ class CSVImportExportHandler(ImportExportHandler):
     def can_write(self, data_metadata: DataAndMetadata.DataMetadata, extension: str) -> bool:
         return 0 < len(data_metadata.dimensional_shape) <= 2
 
-    def write_display_item(self, display_item: DisplayItem.DisplayItem, path: pathlib.Path, extension: str) -> None:
+    def write_display_item(self, display_item: DisplayItemSnapshot, path: pathlib.Path, extension: str) -> None:
         data_item = display_item.data_item
         assert data_item
         assert data_item.data_metadata
@@ -628,9 +696,9 @@ class CSVImportExportHandler(ImportExportHandler):
             numpy.savetxt(path, data, delimiter=', ')
 
 
-def build_table(display_item: DisplayItem.DisplayItem) -> typing.Tuple[typing.List[str], typing.List[_DataArrayType]]:
+def build_table(display_item: DisplayItemSnapshot) -> typing.Tuple[typing.List[str], typing.List[_DataArrayType]]:
     data_items = display_item.data_items
-    assert all([data_item.is_data_1d for data_item in data_items])
+    assert all([data_item.xdata.is_data_1d if data_item.xdata else False for data_item in data_items])
 
     def make_x_data(calibration: Calibration.Calibration, length: int) -> _DataArrayType:
         return numpy.linspace(calibration.offset, calibration.offset + (length - 1) * calibration.scale, length)
@@ -641,34 +709,26 @@ def build_table(display_item: DisplayItem.DisplayItem) -> typing.Tuple[typing.Li
         length = max([data_item.xdata.data_shape[0] if data_item.xdata else 0 for data_item in data_items])
         data_list = [make_x_data(calibration0, length)]
         headers = [f"X ({calibration0.units or 'pixel'})"]
-        for index in range(len(display_item.display_layers)):
-            display_data_channel = display_item.get_display_layer_display_data_channel(index)
-            assert display_data_channel
-            display_values = display_data_channel.get_latest_computed_display_values()
-            assert display_values
-            xdata = display_values.display_data_and_metadata
+        for index, display_layer in enumerate(display_item.display_layers):
+            xdata = display_layer.display_data_and_metadata
             assert xdata
             data = xdata.data
             assert data is not None
             data_list.append(xdata.intensity_calibration.convert_array_to_calibrated_value(data))
-            label = display_item.get_display_layer_property(index, "label") or f"Data {index}"
+            label = display_layer.label or f"Data {index}"
             label = label + f" ({xdata.intensity_calibration.units or 'None'})"
             headers.append(label)
     else:
         data_list = list()
         headers = list()
-        for index in range(len(display_item.display_layers)):
-            display_data_channel = display_item.get_display_layer_display_data_channel(index)
-            assert display_data_channel
-            display_values = display_data_channel.get_latest_computed_display_values()
-            assert display_values
-            xdata = display_values.display_data_and_metadata
+        for index, display_layer in enumerate(display_item.display_layers):
+            xdata = display_layer.display_data_and_metadata
             assert xdata
             data = xdata.data
             assert data is not None
             data_list.append(make_x_data(xdata.dimensional_calibrations[0], xdata.data_shape[0]))
             data_list.append(xdata.intensity_calibration.convert_array_to_calibrated_value(data))
-            label = display_item.get_display_layer_property(index, "label") or f"Data {index}"
+            label = display_layer.label or f"Data {index}"
             x_label = "X " + label + f" ({xdata.dimensional_calibrations[0].units or 'pixel'})"
             y_label = "Y " + label + f" ({xdata.intensity_calibration.units or 'None'})"
             headers.append(x_label)
@@ -685,10 +745,10 @@ class CSV1ImportExportHandler(ImportExportHandler):
     def read_data_elements(self, extension: str, path: pathlib.Path) -> typing.List[DataElementType]:
         return list()
 
-    def can_write_display_item(self, display_item: DisplayItem.DisplayItem, extension: str) -> bool:
-        return all(data_item.is_data_1d for data_item in display_item.data_items)
+    def can_write_display_item(self, display_item: DisplayItemSnapshot, extension: str) -> bool:
+        return all(data_item.xdata.is_data_1d if data_item.xdata else False for data_item in display_item.data_items)
 
-    def write_display_item(self, display_item: DisplayItem.DisplayItem, path: pathlib.Path, extension: str) -> None:
+    def write_display_item(self, display_item: DisplayItemSnapshot, path: pathlib.Path, extension: str) -> None:
         headers, data_list = build_table(display_item)
 
         newline = "\n"
@@ -726,7 +786,7 @@ class NDataImportExportHandler(ImportExportHandler):
     def can_write(self, data_metadata: DataAndMetadata.DataMetadata, extension: str) -> bool:
         return True
 
-    def write_display_item(self, display_item: DisplayItem.DisplayItem, path: pathlib.Path, extension: str) -> None:
+    def write_display_item(self, display_item: DisplayItemSnapshot, path: pathlib.Path, extension: str) -> None:
         data_item = display_item.data_item
         assert data_item
         data_element = create_data_element_from_data_item(data_item, include_data=False)
@@ -768,10 +828,10 @@ class DelegatedImportExportHandler(ImportExportHandler):
         import_data = self.__driver.read_data(file_path, StorageHandlerProvider(project_storage_system))
         return ImportData(import_data.storage_handlers, import_data.uuid_map, import_data.items)
 
-    def can_write_display_item(self, display_item: DisplayItem.DisplayItem, extension: str) -> bool:
-        return any(data_item.has_data for data_item in display_item.data_items)
+    def can_write_display_item(self, display_item: DisplayItemSnapshot, extension: str) -> bool:
+        return any(data_item.data_metadata is not None for data_item in display_item.data_items)
 
-    def write_display_item(self, display_item: DisplayItem.DisplayItem, path: pathlib.Path, extension: str) -> None:
+    def write_display_item(self, display_item: DisplayItemSnapshot, path: pathlib.Path, extension: str) -> None:
         self.__driver.write_display_item(path, [typing.cast(StorageHandler.StorageHandlerExportItem, display_item)])
 
 
@@ -807,7 +867,7 @@ class NumPyImportExportHandler(ImportExportHandler):
     def can_write(self, data_metadata: DataAndMetadata.DataMetadata, extension: str) -> bool:
         return True
 
-    def write_display_item(self, display_item: DisplayItem.DisplayItem, path: pathlib.Path, extension: str) -> None:
+    def write_display_item(self, display_item: DisplayItemSnapshot, path: pathlib.Path, extension: str) -> None:
         data_item = display_item.data_item
         assert data_item
         data_path = path

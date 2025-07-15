@@ -414,7 +414,6 @@ class TestImportExportManagerClass(unittest.TestCase):
         data_item = DataItem.DataItem(numpy.zeros((4, 4, 4)), large_format=True)
         with contextlib.closing(data_item):
             data_element = ImportExportManager.create_data_element_from_data_item(data_item, include_data=True)
-            self.assertTrue(data_element.get("large_format"))
             with contextlib.closing(ImportExportManager.create_data_item_from_data_element(data_element)) as data_item:
                 self.assertTrue(data_item.large_format)
 
@@ -425,8 +424,6 @@ class TestImportExportManagerClass(unittest.TestCase):
             with contextlib.closing(data_item_rgb):
                 data_element = ImportExportManager.create_data_element_from_data_item(data_item, include_data=True)
                 data_element_rgb = ImportExportManager.create_data_element_from_data_item(data_item_rgb, include_data=True)
-                data_element.pop("large_format")
-                data_element_rgb.pop("large_format")
                 with contextlib.closing(ImportExportManager.create_data_item_from_data_element(data_element)) as data_item:
                     with contextlib.closing(ImportExportManager.create_data_item_from_data_element(data_element_rgb)) as data_item_rgb:
                         self.assertTrue(data_item.large_format)

@@ -3197,12 +3197,12 @@ class API_1:
         def can_write(self, data_metadata: DataAndMetadata.DataMetadata, extension: str) -> bool:
             return self.__io_handler_delegate.can_write_data_and_metadata(data_metadata, extension)
 
-        def write_display_item(self, display_item: DisplayItemModule.DisplayItem, path: pathlib.Path, extension: str) -> None:
+        def write_display_item(self, display_item: ImportExportManager.DisplayItemSnapshot, path: pathlib.Path, extension: str) -> None:
             data_item = display_item.data_item
             if data_item:
                 self.write_data_item(data_item, str(path), extension)
 
-        def write_data_item(self, data_item: DataItemModule.DataItem, file_path: str, extension: str) -> None:
+        def write_data_item(self, data_item: ImportExportManager.DataItemSnapshot, file_path: str, extension: str) -> None:
             data_and_metadata = data_item.xdata
             data = data_and_metadata.data if data_and_metadata else None
             if data is not None:
