@@ -735,7 +735,7 @@ class DisplayValues:
     """
     _count = 0
 
-    def __init__(self, data_and_metadata: typing.Optional[DataAndMetadata.DataAndMetadata], sequence_index: int,
+    def __init__(self, xdata_handle: DataItem.DataAndMetadataHandle, sequence_index: int,
                  collection_index: typing.Optional[DataAndMetadata.PositionType], slice_center: int, slice_width: int,
                  display_limits: DisplayLimitsType,
                  complex_display_type: typing.Optional[str],
@@ -743,9 +743,13 @@ class DisplayValues:
                  adjustments: typing.Sequence[Persistence.PersistentDictType]) -> None:
         DisplayValues._count += 1
 
-        self.__data_and_metadata = data_and_metadata
+        # the data from the data handle is only valid as long as the data handle is valid. to ensure this we store
+        # the data handle as a field. the data handle will be released when this object is released.
+        self.__xdata_handle = xdata_handle
+
         self.__color_map_data = color_map_data
 
+        data_and_metadata = self.__xdata_handle.xdata
         data_metadata = data_and_metadata.data_metadata if data_and_metadata else None
 
         self.__element_data_processor = ElementDataProcessor(data=data_and_metadata,
@@ -805,6 +809,7 @@ class DisplayValues:
         )
 
         def finalize() -> None:
+            xdata_handle.close()
             DisplayValues._count -= 1
 
         weakref.finalize(self, finalize)
@@ -815,7 +820,7 @@ class DisplayValues:
 
     @property
     def data_metadata(self) -> DataAndMetadata.DataMetadata | None:
-        return self.__data_and_metadata.data_metadata if self.__data_and_metadata else None
+        return self.__xdata_handle.xdata.data_metadata if self.__xdata_handle and self.__xdata_handle.xdata else None
 
     @property
     def display_rgba_timestamp(self) -> typing.Optional[datetime.datetime]:
@@ -1565,7 +1570,7 @@ class DisplayDataChannel(Persistence.PersistentObject):
         # make display values. this can be converted to a method as it gets more complicated.
         def make_display_values() -> typing.Optional[DisplayValues]:
             if self.__data_item:
-                return DisplayValues(self.__data_item.xdata,
+                return DisplayValues(self.__data_item.get_read_handle(),
                                      self.sequence_index,
                                      self.collection_index,
                                      self.slice_center, self.slice_width,
