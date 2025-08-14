@@ -52,6 +52,7 @@ def end_leaks(test_case: unittest.TestCase) -> None:
     test_case.assertEqual(0, Persistence.PersistentObjectReference.count)
     test_case.assertEqual(0, Persistence.PersistentObject.count)
     test_case.assertEqual(0, ReferenceCounting.ReferenceCounted.count)
+    test_case.assertEqual(0, DataItem.DataItemHandle._count)
     test_case.assertEqual(0, DisplayItem.DisplayValues._count)
     test_case.assertEqual(0, Changes.UndeleteLog.count)
     test_case.assertEqual(0, DisplayItem.DisplayDataChannel._force_sync)

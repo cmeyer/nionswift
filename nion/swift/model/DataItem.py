@@ -127,6 +127,55 @@ class SessionManager(abc.ABC):
         pass
 
 
+class DataAndMetadataHandle(typing.Protocol):
+
+    def __enter__(self) -> DataAndMetadataHandle:
+        return self
+
+    def __exit__(self, exc_type: typing.Optional[typing.Type[BaseException]], exc_value: typing.Optional[BaseException], traceback: typing.Optional[types.TracebackType]) -> None:
+        self.close()
+
+    def close(self) -> None:
+        pass
+
+    @property
+    def data(self) -> _ImageDataType | None:
+        xdata = self.xdata
+        return xdata.data if xdata else None
+
+    @property
+    def xdata(self) -> DataAndMetadata.DataAndMetadata | None: ...
+
+
+class DataItemHandle(DataAndMetadataHandle):
+    _count = 0
+
+    def __init__(self, xdata: DataAndMetadata.DataAndMetadata | None) -> None:
+        DataItemHandle._count += 1
+        self.__xdata = xdata
+
+        def finalize() -> None:
+            DataItemHandle._count -= 1
+
+        weakref.finalize(self, finalize)
+
+    def close(self) -> None:
+        self.__xdata = None
+
+    @property
+    def xdata(self) -> DataAndMetadata.DataAndMetadata | None:
+        return self.__xdata
+
+
+class DataAndMetadataHandleImpl(DataAndMetadataHandle):
+    def __init__(self, xdata: DataAndMetadata.DataAndMetadata | None) -> None:
+        self.__xdata = xdata
+
+    @property
+    def xdata(self) -> DataAndMetadata.DataAndMetadata | None:
+        return self.__xdata
+
+
 # dates are _local_ time and must use this specific ISO 8601 format. 2013-11-17T08:43:21.389391
 # time zones are offsets (east of UTC) in the following format "+HHMM" or "-HHMM"
 # daylight savings times are time offset (east of UTC) in format "+MM" or "-MM"
@@ -975,6 +1024,11 @@ class DataItem(Persistence.PersistentObject):
             return None
         finally:
             self.decrement_data_ref_count()
+
+    @property
+    def get_read_handle(self) -> DataAndMetadataHandle:
+        """Return the data provider for this data item, if any."""
+        return DataItemHandle(self.xdata)
 
     @property
     def source_file_path(self) -> typing.Optional[pathlib.Path]:
