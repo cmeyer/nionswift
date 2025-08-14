@@ -75,7 +75,7 @@ class ImportExportHandler:
             data_item.uuid = uuid.uuid4()
             storage_handler_attributes = FileStorageSystem.make_storage_handler_attributes(data_item)
             storage_handler = project_storage_system._make_storage_handler(storage_handler_attributes)
-            data_item_data = data_item.data
+            data_item_data = data_item.get_read_handle().data
             data_item_data_descriptor = data_item.data_descriptor
             data_item_properties = data_item.write_to_dict()
             data_item_properties["modified"] = data_item.modified.isoformat()
@@ -122,7 +122,7 @@ class ImportExportHandler:
         data_item = display_item.data_item
         assert data_item
         with open(path, 'wb') as f:
-            data = data_item.data
+            data = data_item.get_read_handle().data
             if data is not None:
                 self.write_data(data, extension, f)
 
@@ -190,7 +190,7 @@ class ImportExportManager(metaclass=Utility.Singleton):
         io_handler = self.__find_io_handler_for_extension(extension)
         if io_handler:
             data_items = io_handler.read_data_items(extension, path)
-            return data_items[0].data if data_items else None
+            return data_items[0].get_read_handle().data if data_items else None
         return None
 
     def write_display_item_with_writer(self, writer: ImportExportHandler, display_item: DisplayItem.DisplayItem, path: pathlib.Path) -> None:
@@ -424,7 +424,7 @@ def create_data_element_from_data_item(data_item: DataItem.DataItem, include_dat
     if data_item.has_data:
         data_element["large_format"] = bool(data_item.large_format)
         if include_data:
-            data_element["data"] = data_item.data
+            data_element["data"] = data_item.get_read_handle().data
         dimensional_calibrations = data_item.dimensional_calibrations
         if dimensional_calibrations is not None:
             calibrations_element = list()
@@ -623,7 +623,7 @@ class CSVImportExportHandler(ImportExportHandler):
         data_item = display_item.data_item
         assert data_item
         assert data_item.data_metadata
-        data = data_item.data
+        data = data_item.get_read_handle().data
         if data is not None and self.can_write(data_item.data_metadata, 'csv'):
             numpy.savetxt(path, data, delimiter=', ')
 
@@ -730,7 +730,7 @@ class NDataImportExportHandler(ImportExportHandler):
         data_item = display_item.data_item
         assert data_item
         data_element = create_data_element_from_data_item(data_item, include_data=False)
-        data = data_item.data
+        data = data_item.get_read_handle().data
         if data is not None:
             root = str(path.parent)
             metadata_path = root + "_metadata.json"
@@ -813,7 +813,7 @@ class NumPyImportExportHandler(ImportExportHandler):
         data_path = path
         metadata_path = data_path.with_suffix(".json")
         data_element = create_data_element_from_data_item(data_item, include_data=False)
-        data = data_item.data
+        data = data_item.get_read_handle().data
         if data is not None:
             try:
                 with open(str(metadata_path), "w") as fp:

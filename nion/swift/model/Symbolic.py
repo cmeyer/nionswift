@@ -1080,7 +1080,7 @@ class DataSource:
                     if graphic_.used_role in ("mask", "fourier_mask"):
                         self.__mask_items.append(graphic_.get_mask_item())
         data_item = display_data_channel.data_item if display_data_channel else data_item
-        self.__xdata = data_item.xdata if data_item else None
+        self.__xdata = data_item.get_read_handle().xdata if data_item else None
         self.__display_data_shape_calculator = DisplayItem.DisplayDataShapeCalculator(self.__xdata.data_metadata if self.__xdata else None)
         self.__graphic_bounds = graphic.bounds if isinstance(graphic, Graphics.RectangleTypeGraphic) else None
         self.__graphic_rotation = graphic.rotation if isinstance(graphic, Graphics.RectangleTypeGraphic) else 0.0
@@ -3044,14 +3044,14 @@ class ScriptExpressionComputationExecutor(ComputationExecutor):
                     target_xdata._set_metadata(metadata)
                 self.__data_item.set_xdata(target_xdata)
         if self.__data_item_created:
-            self.__xdata = self.__data_item.xdata
+            self.__xdata = self.__data_item.get_read_handle().xdata
             self.__data_item.close()
             self.__data_item = typing.cast(typing.Any, None)
             self.__data_item_created = False
 
     @property
     def _target_xdata(self) -> typing.Optional[DataAndMetadata.DataAndMetadata]:
-        return self.__data_item.xdata if self.__data_item else self.__xdata
+        return self.__data_item.get_read_handle().xdata if self.__data_item else self.__xdata
 
 
 PersistentDictType = typing.Dict[str, typing.Any]
@@ -3084,7 +3084,7 @@ class ComputationProcessorRequirementDatumCalibrations(ComputationProcessorRequi
 
     def is_data_item_valid(self, data_item: DataItem.DataItem) -> bool:
         if self.requires_equal:
-            xdata = data_item.xdata
+            xdata = data_item.get_read_handle().xdata
             if not xdata or len(set([calibration.units for calibration in xdata.datum_dimensional_calibrations])) != 1:
                 return False
         return True

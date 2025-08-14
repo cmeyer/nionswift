@@ -1008,7 +1008,7 @@ class DataItem(metaclass=SharedInstance):
 
         Scriptable: Yes
         """
-        return self.__data_item.data
+        return self.__data_item.get_read_handle().data
 
     @data.setter
     def data(self, data: NDArray) -> None:
@@ -1041,7 +1041,7 @@ class DataItem(metaclass=SharedInstance):
 
         Scriptable: Yes
         """
-        return self.__data_item.xdata
+        return self.__data_item.get_read_handle().xdata
 
     @xdata.setter
     def xdata(self, data_and_metadata: DataAndMetadata._DataAndMetadataLike) -> None:
@@ -1220,7 +1220,7 @@ class DataItem(metaclass=SharedInstance):
 
         Scriptable: Yes
         """
-        return self.__data_item.xdata
+        return self.__data_item.get_read_handle().xdata
 
     def set_data_and_metadata(self, data_and_metadata: DataAndMetadata.DataAndMetadata) -> None:
         """Set the data and metadata.
@@ -3203,7 +3203,7 @@ class API_1:
                 self.write_data_item(data_item, str(path), extension)
 
         def write_data_item(self, data_item: DataItemModule.DataItem, file_path: str, extension: str) -> None:
-            data_and_metadata = data_item.xdata
+            data_and_metadata = data_item.get_read_handle().xdata
             data = data_and_metadata.data if data_and_metadata else None
             if data is not None:
                 if hasattr(self.__io_handler_delegate, "write_data_item"):

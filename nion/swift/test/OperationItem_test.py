@@ -816,7 +816,7 @@ class TestProcessingClass(unittest.TestCase):
             display_item = document_model.get_display_item_for_data_item(data_item)
             slice_data_item = document_model.get_projection_new(display_item, display_item.data_item)
             document_model.recompute_all()
-            self.assertTrue(numpy.array_equal(numpy.sum(d, 2), slice_data_item.xdata.data))
+            self.assertTrue(numpy.array_equal(numpy.sum(d, 2), slice_data_item.get_read_handle().xdata))
 
     def test_cross_correlate_works_in_1d(self):
         with TestContext.create_memory_context() as test_context:

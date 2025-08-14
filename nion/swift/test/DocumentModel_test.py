@@ -1624,7 +1624,7 @@ class TestDocumentModelClass(unittest.TestCase):
             computation.processing_id = "crop_half"
             document_model.append_computation(computation)
             document_model.recompute_all()
-            self.assertTrue(numpy.array_equal(data_item2.data, data_item.data[3:9, 3:9, 2]))
+            self.assertTrue(numpy.array_equal(data_item2.data, data_item.get_read_handle().data[3:9, 3:9, 2]))
             self.assertEqual(1, len(document_model.get_dependent_items(data_item)))
             self.assertEqual(document_model.get_dependent_items(data_item)[0], data_item2)
             self.assertEqual(2, len(document_model.get_source_items(data_item2)))  # data item, display item
@@ -1678,7 +1678,7 @@ class TestDocumentModelClass(unittest.TestCase):
             computation.processing_id = "crop_half"
             document_model.append_computation(computation)
             document_model.recompute_all()
-            self.assertTrue(numpy.array_equal(data_item2.data, data_item.data[3:9, 3:9, 2]))
+            self.assertTrue(numpy.array_equal(data_item2.data, data_item.get_read_handle().data[3:9, 3:9, 2]))
             self.assertEqual(1, len(document_model.get_dependent_items(data_item)))
             self.assertEqual(document_model.get_dependent_items(data_item)[0], data_item2)
             self.assertEqual(1, len(document_model.get_dependent_items(graphic)))

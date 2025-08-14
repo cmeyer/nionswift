@@ -280,7 +280,7 @@ class TestDisplayClass(unittest.TestCase):
             map = {"a": Symbolic.make_item(data_item)}
             data_item2 = document_controller.processing_computation("target.xdata = a.xdata[:,:,0:8]", map)
             document_model.recompute_all()
-            assert numpy.array_equal(data_item2.data, d[:, :, 0:8])
+            assert numpy.array_equal(data_item2.get_read_handle().data, d[:, :, 0:8])
             display_item = document_model.get_display_item_for_data_item(data_item2)
             display_data_channel = display_item.display_data_channels[0]
             display_data_channel.slice_center = 6

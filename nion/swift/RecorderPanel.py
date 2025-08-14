@@ -73,7 +73,7 @@ class Recorder:
                     self.on_data_item_removed()
 
         def data_changed() -> None:
-            current_xdata = self.__data_item.xdata
+            current_xdata = self.__data_item.get_read_handle().xdata
             if current_xdata and not current_xdata.is_sequence:
                 # allow registered metadata_display components to populate a dictionary
                 # the recorder will look at 'valid_rows'
@@ -200,7 +200,7 @@ class Recorder:
                     # no first image yet
                     return
                 # now record the new data. it may or may not be a new frame at this point.
-                last_xdata = self.__recording_data_item.xdata
+                last_xdata = self.__recording_data_item.get_read_handle().xdata
                 self.__recording_index += 1
                 recording_data_shape = self.__recording_data_item.data_shape
                 if current_xdata and last_xdata and recording_data_shape is not None and current_xdata.data_shape == recording_data_shape[1:]:

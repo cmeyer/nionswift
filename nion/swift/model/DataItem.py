@@ -393,7 +393,7 @@ class DataItem(Persistence.PersistentObject):
             data_item_copy.session_data = copy.deepcopy(self.session_data)
             data_item_copy.category = self.category
             # data and metadata
-            data_item_copy.set_data_and_metadata(copy.deepcopy(self.data_and_metadata), self.data_modified)
+            data_item_copy.set_data_and_metadata(copy.deepcopy(self.__xdata), self.data_modified)
             # copy this last and avoid making an extra unnecessary copy
             data_item_copy.__set_dynamic_title(copy.deepcopy(self.__dynamic_title) if self.__dynamic_title else None)
             memo[id(self)] = data_item_copy
@@ -996,7 +996,7 @@ class DataItem(Persistence.PersistentObject):
     _data_count = 0
 
     @property
-    def xdata(self) -> typing.Optional[DataAndMetadata.DataAndMetadata]:
+    def __xdata(self) -> typing.Optional[DataAndMetadata.DataAndMetadata]:
         self.increment_data_ref_count()
         try:
             if self.__data_metadata and self.__data is not None:
@@ -1026,9 +1026,13 @@ class DataItem(Persistence.PersistentObject):
             self.decrement_data_ref_count()
 
     @property
+    def xdata(self) -> DataAndMetadata.DataAndMetadata | None:
+        assert not self.is_collection and not self.is_sequence, "xdata should not be used for collections or sequences; use get_read_handle instead"
+        return self.__xdata
+
     def get_read_handle(self) -> DataAndMetadataHandle:
         """Return the data provider for this data item, if any."""
-        return DataItemHandle(self.xdata)
+        return DataItemHandle(self.__xdata)
 
     @property
     def source_file_path(self) -> typing.Optional[pathlib.Path]:
@@ -1066,7 +1070,8 @@ class DataItem(Persistence.PersistentObject):
 
     @property
     def data(self) -> typing.Optional[_ImageDataType]:
-        return self.__get_data()
+        xdata = self.xdata
+        return xdata.data if xdata else None
 
     def set_data(self, data: _ImageDataType, data_modified: typing.Optional[datetime.datetime] = None) -> None:
         timezone = Utility.get_local_timezone()
@@ -1111,14 +1116,14 @@ class DataItem(Persistence.PersistentObject):
         return DataItem.DataAccessor(self, self.__get_data, self.__set_data)
 
     def __get_data(self) -> typing.Optional[_ImageDataType]:
-        xdata = self.xdata
+        xdata = self.__xdata
         return xdata.data if xdata else None
 
     def __set_data(self, data: typing.Optional[_ImageDataType], data_modified: typing.Optional[datetime.datetime] = None) -> None:
         with self.data_source_changes():
             if data is not None:
                 dimensional_shape = Image.dimensional_shape_from_data(data)
-                data_and_metadata = self.data_and_metadata
+                data_and_metadata = self.__xdata
                 intensity_calibration = data_and_metadata.intensity_calibration if data_and_metadata else None
                 dimensional_calibrations: typing.Optional[typing.List[Calibration.Calibration]] = None
                 metadata: typing.Optional[DataAndMetadata.MetadataType] = None
@@ -1240,9 +1245,9 @@ class DataItem(Persistence.PersistentObject):
     def data_metadata(self) -> typing.Optional[DataAndMetadata.DataMetadata]:
         return self.__data_metadata
 
-    @property
-    def data_and_metadata(self) -> typing.Optional[DataAndMetadata.DataAndMetadata]:
-        return self.xdata
+    # @property
+    # def data_and_metadata(self) -> typing.Optional[DataAndMetadata.DataAndMetadata]:
+    #     return self.xdata
 
     def __load_data(self) -> None:
         if self.persistent_object_context and self.__data is None and self.__data_metadata:
@@ -1484,7 +1489,7 @@ class DataItem(Persistence.PersistentObject):
         return self.__data_metadata is not None and self.__data_metadata.is_data_bool
 
     def get_data_value(self, pos: DataAndMetadata.ShapeType) -> typing.Any:
-        xdata = self.xdata
+        xdata = self.__xdata
         return xdata.get_data_value(pos) if xdata else None
 
     @property
