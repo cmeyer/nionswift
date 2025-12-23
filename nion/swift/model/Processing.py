@@ -37,42 +37,44 @@ _ProcessingResult = DataAndMetadata.DataAndMetadata | DataAndMetadata.ScalarAndM
 _ = gettext.gettext
 
 
-class ProcessingDataSource:
-    """A data source that provides cropped and filtered versions of the xdata passed to it.
-
-    For element by element processing, this class is used to provide the xdata for each element.
-    """
-
-    def __init__(self, data_source: Facade.DataSource, xdata: DataAndMetadata.DataAndMetadata) -> None:
-        self.__data_source = data_source
-        self.__xdata = xdata
-
-    @property
-    def cropped_display_xdata(self) -> typing.Optional[DataAndMetadata.DataAndMetadata]:
-        return self.__data_source._data_source._crop_xdata(self.__xdata)
-
-    @property
-    def filtered_xdata(self) -> typing.Optional[DataAndMetadata.DataAndMetadata]:
-        xdata = self.__xdata
-        filter_xdata = self.__data_source.filter_xdata
-        if filter_xdata:
-            if xdata.is_data_complex_type:
-                return Core.function_fourier_mask(xdata, filter_xdata)
-            else:
-                return filter_xdata * xdata
-        return xdata
-
-    @property
-    def xdata(self) -> typing.Optional[DataAndMetadata.DataAndMetadata]:
-        return self.__xdata
-
-
 class ProcessingComputation:
     def __init__(self, processing_component: ProcessingBase, computation: Facade.Computation, **kwargs: typing.Any) -> None:
         self.computation = computation
         self.processing_component = processing_component
         self.__data_map = dict[str, _ImageDataType]()
         self.__xdata_map = dict[str, DataAndMetadata.DataAndMetadata]()
+        self.__filter_xdata: DataAndMetadata.DataAndMetadata | None = None
+
+    def __get_input_data(self, index: tuple[slice | int | numpy.int32 | numpy.int64] | None, **kwargs: typing.Any) -> dict[str, DataAndMetadata.DataAndMetadata]:
+        data_map = dict[str, DataAndMetadata.DataAndMetadata]()
+        for source_d in self.processing_component.sources:
+            source = Symbolic.ComputationProcessorSource.from_dict(source_d)
+            data_source = typing.cast("Facade.DataSource | None", kwargs.get(source.name, None))
+            if data_source:
+                xdata: DataAndMetadata.DataAndMetadata | None = None
+                if index is not None:
+                    xdata = data_source.xdata[index] if data_source.xdata and data_source.xdata.is_navigable else None
+                # if the index is None, xdata will be None here. in that case, we use the element xdata from the data
+                # source, which will be based on the UI collection index and slices.
+                if xdata is None:
+                    xdata = data_source.element_xdata
+                if xdata:
+                    if source.data_type == "xdata":
+                        if source.is_croppable:
+                            xdata = data_source._data_source._crop_xdata(xdata)
+                    elif source.data_type == "filtered_xdata":
+                        if not self.__filter_xdata:
+                            self.__filter_xdata = data_source.filter_xdata
+                        if self.__filter_xdata:
+                            if xdata.is_data_complex_type:
+                                xdata = Core.function_fourier_mask(xdata, self.__filter_xdata)
+                            else:
+                                xdata = self.__filter_xdata * xdata
+                    else:
+                        raise ValueError(f"Unsupported source data type: {source.data_type}")
+                    if xdata:
+                        data_map[source.name] = xdata
+        return data_map
 
     def execute(self, **kwargs: typing.Any) -> None:
         # let the processing component do the processing and store result in the xdata field.
@@ -86,11 +88,12 @@ class ProcessingComputation:
             assert xdata
             indexes = numpy.ndindex(xdata.navigation_dimension_shape)
             for index in indexes:
-                index_data_source = ProcessingDataSource(data_source, xdata[index])
-                index_kw_args = {next(iter(kwargs.keys())): index_data_source}
-                for k, v in list(kwargs.items())[1:]:
-                    index_kw_args[k] = v
-                processed_data_map = self.processing_component.process(**index_kw_args)
+                data_sources = self.__get_input_data(index, **kwargs)
+                index_kw_args = dict[str, typing.Any]()
+                for k, v in list(kwargs.items()):
+                    if k not in data_sources:
+                        index_kw_args[k] = v
+                processed_data_map = self.processing_component.process(data_sources, **index_kw_args)
                 for key, processed_data in processed_data_map.items():
                     assert key in output_keys
                     if isinstance(processed_data, DataAndMetadata.DataAndMetadata):
@@ -117,13 +120,12 @@ class ProcessingComputation:
                         self.__data_map[key][index] = index_scalar.value
         elif not self.processing_component.is_scalar:
             src_name = self.processing_component.sources[0]["name"]
-            data_source = typing.cast("Facade.DataSource", kwargs[src_name])
-            xdata = data_source.element_xdata
-            assert xdata
-            element_data_source = ProcessingDataSource(data_source, xdata)
-            new_kwargs = dict(kwargs)
-            new_kwargs["src"] = element_data_source
-            processed_data_map = self.processing_component.process(**new_kwargs)
+            data_sources = self.__get_input_data(None, **kwargs)
+            index_kw_args = dict[str, typing.Any]()
+            for k, v in list(kwargs.items()):
+                if k not in data_sources:
+                    index_kw_args[k] = v
+            processed_data_map = self.processing_component.process(data_sources, **index_kw_args)
             for key, processed_data in processed_data_map.items():
                 assert key in output_keys
                 if isinstance(processed_data, DataAndMetadata.DataAndMetadata):
@@ -155,7 +157,7 @@ class ProcessingBase:
     def register_computation(self) -> None:
         Symbolic.register_computation_type(self.processing_id, functools.partial(ProcessingComputation, self))
 
-    def process(self, *, src: ProcessingDataSource, **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
+    def process(self, data_sources: typing.Mapping[str, DataAndMetadata.DataAndMetadata], **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
         raise NotImplementedError()
 
 
@@ -173,9 +175,11 @@ class ProcessingFFT(ProcessingBase):
         ]
         self.is_mappable = True
 
-    def process(self, *, src: ProcessingDataSource, **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
-        cropped_display_xdata = src.cropped_display_xdata
-        return {"target": xd.fft(cropped_display_xdata) if cropped_display_xdata else None}
+    def process(self, data_sources: typing.Mapping[str, DataAndMetadata.DataAndMetadata], **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
+        src_xdata = data_sources.get("src", None)
+        if src_xdata:
+            return {"target": xd.fft(src_xdata)}
+        return dict()
 
 
 class ProcessingIFFT(ProcessingBase):
@@ -191,9 +195,11 @@ class ProcessingIFFT(ProcessingBase):
             {"name": "target", "label": _("Result")},
         ]
 
-    def process(self, *, src: ProcessingDataSource, **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
-        src_xdata = src.xdata
-        return {"target": xd.ifft(src_xdata) if src_xdata else None}
+    def process(self, data_sources: typing.Mapping[str, DataAndMetadata.DataAndMetadata], **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
+        src_xdata = data_sources.get("src", None)
+        if src_xdata:
+            return {"target": xd.ifft(src_xdata)}
+        return dict()
 
 
 class ProcessingGaussianWindow(ProcessingBase):
@@ -222,9 +228,9 @@ class ProcessingGaussianWindow(ProcessingBase):
         ]
         self.is_mappable = True
 
-    def process(self, *, src: ProcessingDataSource, **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
+    def process(self, data_sources: typing.Mapping[str, DataAndMetadata.DataAndMetadata], **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
+        src_xdata = data_sources.get("src", None)
         sigma = kwargs.get("sigma", 1.0)
-        src_xdata = src.xdata
         if src_xdata and src_xdata.datum_dimension_count == 1:
             w = src_xdata.datum_dimension_shape[0]
             return {"target": src_xdata * scipy.signal.windows.gaussian(src_xdata.datum_dimension_shape[0], std=w / 2)}
@@ -252,8 +258,8 @@ class ProcessingHammingWindow(ProcessingBase):
         ]
         self.is_mappable = True
 
-    def process(self, *, src: ProcessingDataSource, **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
-        src_xdata = src.xdata
+    def process(self, data_sources: typing.Mapping[str, DataAndMetadata.DataAndMetadata], **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
+        src_xdata = data_sources.get("src", None)
         if src_xdata and src_xdata.datum_dimension_count == 1:
             return {"target": src_xdata * scipy.signal.windows.hamming(src_xdata.datum_dimension_shape[0])}
         elif src_xdata and src_xdata.datum_dimension_count == 2:
@@ -279,8 +285,8 @@ class ProcessingHannWindow(ProcessingBase):
         ]
         self.is_mappable = True
 
-    def process(self, *, src: ProcessingDataSource, **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
-        src_xdata = src.xdata
+    def process(self, data_sources: typing.Mapping[str, DataAndMetadata.DataAndMetadata], **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
+        src_xdata = data_sources.get("src", None)
         if src_xdata and  src_xdata.datum_dimension_count == 1:
             return {"target": src_xdata * scipy.signal.windows.hann(src_xdata.datum_dimension_shape[0])}
         elif src_xdata and src_xdata.datum_dimension_count == 2:
@@ -299,7 +305,7 @@ class ProcessingMappedSum(ProcessingBase):
         self.title = _("Mapped Sum")
         self.sections = {"scalar-maps"}
         self.sources = [
-            {"name": "src", "label": _("Source"), "croppable": True, "data_type": "xdata", "requirements": [{"type": "datum_rank", "values": (1, 2)}]},
+            {"name": "src", "label": _("Source"), "croppable": True, "data_type": "filtered_xdata", "requirements": [{"type": "datum_rank", "values": (1, 2)}]},
         ]
         self.outputs = [
             {"name": "target", "label": _("Result")},
@@ -308,8 +314,8 @@ class ProcessingMappedSum(ProcessingBase):
         self.is_scalar = True
         self.attributes["connection_type"] = "map"
 
-    def process(self, *, src: ProcessingDataSource, **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
-        filtered_xdata = src.filtered_xdata
+    def process(self, data_sources: typing.Mapping[str, DataAndMetadata.DataAndMetadata], **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
+        filtered_xdata = data_sources.get("src", None)
         if filtered_xdata:
             return {"target": DataAndMetadata.ScalarAndMetadata.from_value(numpy.sum(filtered_xdata), filtered_xdata.intensity_calibration)}
         return dict()
@@ -322,7 +328,7 @@ class ProcessingMappedAverage(ProcessingBase):
         self.title = _("Mapped Average")
         self.sections = {"scalar-maps"}
         self.sources = [
-            {"name": "src", "label": _("Source"), "croppable": True, "data_type": "xdata", "requirements": [{"type": "datum_rank", "values": (1, 2)}]},
+            {"name": "src", "label": _("Source"), "croppable": True, "data_type": "filtered_xdata", "requirements": [{"type": "datum_rank", "values": (1, 2)}]},
         ]
         self.outputs = [
             {"name": "target", "label": _("Result")}
@@ -331,8 +337,8 @@ class ProcessingMappedAverage(ProcessingBase):
         self.is_scalar = True
         self.attributes["connection_type"] = "map"
 
-    def process(self, *, src: ProcessingDataSource, **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
-        filtered_xdata = src.filtered_xdata
+    def process(self, data_sources: typing.Mapping[str, DataAndMetadata.DataAndMetadata], **kwargs: typing.Any) -> typing.Mapping[str, _ProcessingResult]:
+        filtered_xdata = data_sources.get("src", None)
         if filtered_xdata:
             return {"target": DataAndMetadata.ScalarAndMetadata.from_value(numpy.average(filtered_xdata), filtered_xdata.intensity_calibration)}
         return dict()
