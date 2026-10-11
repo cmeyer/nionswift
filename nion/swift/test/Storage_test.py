@@ -1275,6 +1275,314 @@ class TestStorageClass(unittest.TestCase):
             replaced_data_handle = None
             current_data_handle = None
 
+    def test_hdf5_data_item_removed_while_its_data_is_held_keeps_its_file_for_the_holder_until_it_lets_go(self):
+        stored = numpy.random.default_rng(57).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            open_count = HDF5Handler.HDF5FileEntry._open_count
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                trash_file_path = document_model._project.project_storage_system._trash_dir / file_path.name
+                data_handle = data_item.data
+                document_model.remove_data_item(data_item)
+                self.assertEqual(0, len(document_model.data_items))
+                # the holder reads the data but can't write it. the file stays at its path, marked removed.
+                self.assertTrue(numpy.array_equal(stored, numpy.asarray(data_handle)))
+                with self.assertRaises(ValueError):
+                    data_handle[1] = numpy.full((5, 7), 2.0, numpy.float32)
+                self.assertTrue(file_path.exists())
+                self.assertFalse(trash_file_path.exists())
+                with h5py.File(file_path, "r") as f:
+                    self.assertEqual(HDF5Handler.REMOVED_FILE_VERSION, json.loads(f["data"].attrs["properties"])["version"])
+                document_model.close_released_files()
+                self.assertTrue(file_path.exists())
+                self.assertEqual(open_count + 1, HDF5Handler.HDF5FileEntry._open_count)
+                # once the holder lets go, the file closes and moves into the trash.
+                data_handle = None
+                document_model.close_released_files()
+                self.assertFalse(file_path.exists())
+                self.assertTrue(trash_file_path.exists())
+                self.assertEqual(open_count, HDF5Handler.HDF5FileEntry._open_count)
+
+    def test_hdf5_data_item_removed_and_restored_while_its_data_is_held_is_back_with_its_data_and_writable(self):
+        stored = numpy.random.default_rng(57).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            open_count = HDF5Handler.HDF5FileEntry._open_count
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                trash_dir = document_model._project.project_storage_system._trash_dir
+                data_handle = data_item.data
+                undelete_log = document_model.remove_data_item_with_log(data_item)
+                # the removed file stays at its path while it is held.
+                self.assertTrue(file_path.exists())
+                self.assertFalse(trash_dir.exists() and any(trash_dir.iterdir()))
+                document_model.undelete_all(undelete_log)
+                undelete_log.close()
+                self.assertEqual(1, len(document_model.data_items))
+                data_item = document_model.data_items[0]
+                self.assertEqual(file_path, pathlib.Path(data_item._test_get_file_path()))
+                self.assertTrue(numpy.array_equal(stored, data_item.data))
+                with h5py.File(file_path, "r") as f:
+                    self.assertEqual(DataItem.DataItem.writer_version, json.loads(f["data"].attrs["properties"])["version"])
+                # the restored item writes its file, which the earlier holder still reads but can't write.
+                data_item.set_data(replacement)
+                self.assertTrue(numpy.array_equal(replacement, data_item.data))
+                self.assertTrue(numpy.array_equal(replacement, numpy.asarray(data_handle)))
+                with self.assertRaises(ValueError):
+                    data_handle[1] = numpy.full((5, 7), 2.0, numpy.float32)
+                # once the earlier holder lets go, its file closes and stays the item's file.
+                data_handle = None
+                document_model.close_released_files()
+                self.assertTrue(file_path.exists())
+                self.assertFalse(trash_dir.exists() and any(trash_dir.iterdir()))
+                self.assertEqual(open_count + 1, HDF5Handler.HDF5FileEntry._open_count)
+                self.assertTrue(numpy.array_equal(replacement, data_item.data))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual(1, len(document_model.data_items))
+                self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+
+    def test_hdf5_data_item_removed_and_restored_while_its_data_is_held_keeps_its_file_where_it_was_found(self):
+        stored = numpy.random.default_rng(57).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            # the item is made in an earlier session.
+            document_model.session_id = "20000630-150200"
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                # setting the data in this session moves the item to this session, whose folder is not where its file is.
+                data_item.set_data(replacement)
+                data_handle = data_item.data
+                undelete_log = document_model.remove_data_item_with_log(data_item)
+                document_model.undelete_all(undelete_log)
+                undelete_log.close()
+                data_item = document_model.data_items[0]
+                self.assertEqual(file_path, pathlib.Path(data_item._test_get_file_path()))
+                self.assertTrue(numpy.array_equal(replacement, data_item.data))
+                data_handle = None
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual(1, len(document_model.data_items))
+                self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+
+    def test_hdf5_data_item_removed_while_its_data_is_held_is_restored_from_the_trash_after_the_holder_lets_go(self):
+        stored = numpy.random.default_rng(57).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                trash_file_path = document_model._project.project_storage_system._trash_dir / file_path.name
+                data_handle = data_item.data
+                undelete_log = document_model.remove_data_item_with_log(data_item)
+                # the removed file stays at its path until the holder lets go, then moves into the trash.
+                self.assertTrue(file_path.exists())
+                self.assertFalse(trash_file_path.exists())
+                data_handle = None
+                document_model.close_released_files()
+                self.assertFalse(file_path.exists())
+                self.assertTrue(trash_file_path.exists())
+                document_model.undelete_all(undelete_log)
+                undelete_log.close()
+                self.assertFalse(trash_file_path.exists())
+                self.assertEqual(1, len(document_model.data_items))
+                data_item = document_model.data_items[0]
+                self.assertEqual(file_path, pathlib.Path(data_item._test_get_file_path()))
+                self.assertTrue(numpy.array_equal(stored, data_item.data))
+                with h5py.File(file_path, "r") as f:
+                    self.assertEqual(DataItem.DataItem.writer_version, json.loads(f["data"].attrs["properties"])["version"])
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual(1, len(document_model.data_items))
+                self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+
+    def test_copy_of_project_made_while_a_removed_hdf5_file_is_held_loads_without_the_item_and_deletes_its_file(self):
+        removed_data = numpy.random.default_rng(57).random((3, 5, 7)).astype(numpy.float32)
+        kept_data = numpy.random.default_rng(58).random((4, 6, 2)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(removed_data))
+                document_model.append_data_item(DataItem.DataItem(kept_data))
+            document_model = profile_context.create_document_model(auto_close=False)
+            profile = typing.cast(Profile.Profile, document_model._profile_for_test)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                kept_data_item_uuid = document_model.data_items[1].uuid
+                data_handle = data_item.data
+                document_model.remove_data_item(data_item)
+                # copy the project while the removed file is held, as a crash would leave it.
+                shutil.copy(profile_context.projects_dir / "Project.nsproj", profile_context.projects_dir / "Crash.nsproj")
+                shutil.copytree(profile_context.projects_dir / "Project Data", profile_context.projects_dir / "Crash Data")
+                data_handle = None
+            crash_data_folder = profile_context.projects_dir / "Crash Data"
+            # the copy holds the removed item's file where it was, outside the trash.
+            self.assertEqual(2, len([file_path for file_path in crash_data_folder.rglob("*.h5") if file_path.parent.name != "trash"]))
+            project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
+            profile.read_project(project_reference)
+            document_model = project_reference.document_model
+            self.assertEqual([kept_data_item_uuid], [data_item.uuid for data_item in document_model.data_items])
+            self.assertTrue(numpy.array_equal(kept_data, document_model.data_items[0].data))
+            self.assertEqual([pathlib.Path(document_model.data_items[0]._test_get_file_path())], [file_path for file_path in crash_data_folder.rglob("*.h5")])
+
+    @unittest.skipIf(sys.platform == "win32", "Windows doesn't make a folder read-only with chmod.")
+    def test_copy_of_project_made_while_a_removed_hdf5_file_is_held_loads_without_the_item_while_its_folder_refuses_the_delete(self):
+        stored = numpy.random.default_rng(57).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            profile = typing.cast(Profile.Profile, document_model._profile_for_test)
+            with document_model.ref():
+                data_handle = document_model.data_items[0].data
+                document_model.remove_data_item(document_model.data_items[0])
+                # copy the project while the removed file is held, as a crash would leave it.
+                shutil.copy(profile_context.projects_dir / "Project.nsproj", profile_context.projects_dir / "Crash.nsproj")
+                shutil.copytree(profile_context.projects_dir / "Project Data", profile_context.projects_dir / "Crash Data")
+                data_handle = None
+            crash_file_path = profile_context.projects_dir / "Crash Data" / file_path.relative_to(profile_context.projects_dir / "Project Data")
+            # the folder refuses the delete of the removed item's file at the load, so the file stays until a later load.
+            crash_file_path.parent.chmod(0o555)
+            try:
+                project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
+                profile.read_project(project_reference)
+                self.assertEqual(0, len(project_reference.document_model.data_items))
+                project_reference.unload_project()
+            finally:
+                crash_file_path.parent.chmod(0o755)
+            self.assertTrue(crash_file_path.exists())
+            profile.read_project(project_reference)
+            self.assertEqual(0, len(project_reference.document_model.data_items))
+            self.assertFalse(crash_file_path.exists())
+
+    def test_closing_project_moves_a_removed_hdf5_file_into_the_trash_while_its_data_is_held(self):
+        stored = numpy.random.default_rng(57).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            open_count = HDF5Handler.HDF5FileEntry._open_count
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                trash_file_path = document_model._project.project_storage_system._trash_dir / file_path.name
+                data_handle = data_item.data
+                document_model.remove_data_item(data_item)
+                self.assertTrue(file_path.exists())
+            self.assertFalse(file_path.exists())
+            self.assertTrue(trash_file_path.exists())
+            self.assertEqual(open_count, HDF5Handler.HDF5FileEntry._open_count)
+            data_handle = None
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual(0, len(document_model.data_items))
+
+    @unittest.skipIf(sys.platform == "win32", "Windows doesn't make a folder read-only with chmod.")
+    def test_hdf5_data_item_removed_while_the_trash_refuses_its_file_moves_it_once_the_trash_takes_it(self):
+        stored = numpy.random.default_rng(57).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                trash_dir = document_model._project.project_storage_system._trash_dir
+                trash_dir.mkdir()
+                trash_dir.chmod(0o555)
+                try:
+                    # the file isn't held, but the trash refuses it, so it stays at its path, marked removed.
+                    document_model.remove_data_item(data_item)
+                    self.assertEqual(0, len(document_model.data_items))
+                    self.assertTrue(file_path.exists())
+                    with h5py.File(file_path, "r") as f:
+                        self.assertEqual(HDF5Handler.REMOVED_FILE_VERSION, json.loads(f["data"].attrs["properties"])["version"])
+                    document_model.close_released_files()
+                    self.assertTrue(file_path.exists())
+                    trash_dir.chmod(0o755)
+                    document_model.close_released_files()
+                    self.assertFalse(file_path.exists())
+                    self.assertTrue((trash_dir / file_path.name).exists())
+                finally:
+                    trash_dir.chmod(0o755)
+
+    @unittest.skipUnless(sys.platform == "win32", "Only Windows refuses the move of a file which another program has open.")
+    def test_hdf5_data_item_removed_while_another_program_has_its_file_open_moves_it_into_the_trash_once_let_go(self):
+        stored = numpy.random.default_rng(57).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                trash_file_path = document_model._project.project_storage_system._trash_dir / file_path.name
+                # the file isn't held, but another program has it open, which refuses its move into the trash.
+                with open(file_path, "rb"):
+                    document_model.remove_data_item(data_item)
+                    document_model.close_released_files()
+                    self.assertEqual(0, len(document_model.data_items))
+                    self.assertTrue(file_path.exists())
+                document_model.close_released_files()
+                self.assertFalse(file_path.exists())
+                self.assertTrue(trash_file_path.exists())
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual(0, len(document_model.data_items))
+
+    def test_moving_or_deleting_a_data_file_which_this_process_has_open_is_refused(self):
+        with create_temp_profile_context() as profile_context:
+            file_path = profile_context.workspace_dir / "data.h5"
+            new_file_path = profile_context.workspace_dir / "moved.h5"
+            file = HDF5Handler.HDF5FileEntry(file_path)
+            file.open()
+            try:
+                with self.assertRaises(PermissionError):
+                    HDF5Handler.move_data_file(file_path, new_file_path)
+                with self.assertRaises(PermissionError):
+                    HDF5Handler.move_data_file(file_path, None)
+                # another spelling of the open path is refused too.
+                with self.assertRaises(PermissionError):
+                    HDF5Handler.move_data_file(file_path.parent / ".." / file_path.parent.name / file_path.name, None)
+                self.assertTrue(file_path.exists())
+            finally:
+                file.close()
+            HDF5Handler.move_data_file(file_path, new_file_path)
+            self.assertFalse(file_path.exists())
+            self.assertTrue(new_file_path.exists())
+
     def test_hdf5_files_read_through_xdata_stay_open_until_idle_for_the_delay_then_close(self):
         stored_list = [numpy.random.default_rng(46 + index).random((3, 5 + index, 7)).astype(numpy.float32) for index in range(4)]
         clock_time = [100.0]

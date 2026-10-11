@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import collections
+import dataclasses
 import datetime
+import errno
 import io
 import json
 import logging
 import os
 import pathlib
+import shutil
 import sys
 import threading
 import typing
@@ -121,15 +124,84 @@ _HDF5FilePointer = typing.Any
 # Windows refuses to delete or rename a file held open, so there a held file is closed under its holders.
 _retire_held_files = sys.platform != "win32"
 
+# the version written into the properties of a removed data item's file while the file stays at its own path. earlier
+# versions and this one skip a data file whose version is not the one they write.
+REMOVED_FILE_VERSION = -1
+
+
+# the key of a path in the open paths. this process makes the path of each data file from its project's data folder, so
+# the same file always has the same path, up to its case and separators on Windows, and the key doesn't resolve symlinks,
+# which on Windows opens the file.
+def _get_open_path_key(path: pathlib.Path) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def move_data_file(file_path: pathlib.Path, new_file_path: pathlib.Path | None, *, reason: str | None = None) -> None:
+    """Move the data file at file_path to new_file_path, or delete it when new_file_path is None.
+
+    The reason, if given, goes into the data files log with the move.
+
+    Raises PermissionError, changing nothing, if either path is open in this process, as Windows refuses to move or delete
+    a file this process has open. Raises OSError if the file system refuses.
+    """
+    for path in (file_path, new_file_path):
+        if path is not None and HDF5FileEntry.is_path_open(path):
+            raise PermissionError(errno.EACCES, "Data file is open in this process", str(path))
+    if new_file_path is not None:
+        try:
+            # shutil.move copies the file when the rename fails for any reason, so a refused rename would cost a whole copy.
+            os.rename(file_path, new_file_path)
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise
+            # another file system mounted on the data folder's trash or date folders.
+            shutil.move(file_path, new_file_path)
+        if reason is not None:
+            data_files_logger.debug("data file moved: %s, to %s, reason %s", file_path, new_file_path, reason)
+        else:
+            data_files_logger.debug("data file moved: %s, to %s", file_path, new_file_path)
+    else:
+        os.remove(file_path)
+        if reason is not None:
+            data_files_logger.debug("data file deleted: %s, reason %s", file_path, reason)
+        else:
+            data_files_logger.debug("data file deleted: %s", file_path)
+
+
+def move_data_file_to_trash(file_path: pathlib.Path, trash_file_path: pathlib.Path, *, reason: str | None = None) -> None:
+    """Move the data file at file_path to trash_file_path, making the trash folder if needed.
+
+    A file of the same name already in the trash stays, and the data file is deleted instead. The reason, if given, goes
+    into the data files log with the move or delete. Raises as move_data_file.
+    """
+    if trash_file_path.exists():
+        move_data_file(file_path, None, reason=reason)
+    else:
+        trash_file_path.parent.mkdir(exist_ok=True)
+        move_data_file(file_path, trash_file_path, reason=reason)
+
+
+# mark the dataset's properties removed, leaving the rest of them as they are; return the data item uuid. the dataset is an
+# h5py dataset, which has no type information.
+def _mark_dataset_removed(dataset: typing.Any) -> uuid.UUID:
+    properties = typing.cast(PersistentDictType, json.loads(dataset.attrs.get("properties", "")))
+    properties["version"] = REMOVED_FILE_VERSION
+    dataset.attrs["properties"] = json.dumps(properties)
+    return uuid.UUID(properties["uuid"])
+
 
 class HDF5FileEntry:
     """An HDF5 file at a path, opened when first used and owned by one handler.
 
     Each handler opens its own file, so closing it affects only that handler's data. The file may be opened again after
-    it is closed. The count of open files is kept for detecting unclosed files in tests.
+    it is closed. The count of open files is kept for detecting unclosed files in tests, and the paths of open files so
+    that move_data_file refuses to move or delete a file which this process has open.
     """
     _open_count = 0
     __open_count_lock = threading.Lock()
+    # the paths of the open files, each with the number of entries which have it open, so that nothing in this process
+    # moves or deletes a file it has open. the open count lock protects it.
+    __open_paths: dict[str, int] = collections.defaultdict(int)
 
     def __init__(self, path: pathlib.Path, *, locking: bool = True) -> None:
         self.__lock = threading.RLock()
@@ -159,6 +231,7 @@ class HDF5FileEntry:
                 self.__fp = h5py.File(self.__path, "a", locking=None if self.__locking else False)
                 with HDF5FileEntry.__open_count_lock:
                     HDF5FileEntry._open_count += 1
+                    HDF5FileEntry.__open_paths[_get_open_path_key(self.__path)] += 1
 
     def close(self) -> None:
         with self.__lock:
@@ -166,7 +239,17 @@ class HDF5FileEntry:
                 self.__fp.close()
                 with HDF5FileEntry.__open_count_lock:
                     HDF5FileEntry._open_count -= 1
+                    open_path_key = _get_open_path_key(self.__path)
+                    HDF5FileEntry.__open_paths[open_path_key] -= 1
+                    if HDF5FileEntry.__open_paths[open_path_key] == 0:
+                        del HDF5FileEntry.__open_paths[open_path_key]
             self.__fp = None
+
+    @staticmethod
+    def is_path_open(path: pathlib.Path) -> bool:
+        """Return whether any entry in this process has the file at path open."""
+        with HDF5FileEntry.__open_count_lock:
+            return _get_open_path_key(path) in HDF5FileEntry.__open_paths
 
     @property
     def is_open(self) -> bool:
@@ -174,12 +257,30 @@ class HDF5FileEntry:
             return self.__fp is not None
 
 
+@dataclasses.dataclass(frozen=True)
+class HDF5RemovedFile:
+    """A file of a removed data item, marked removed, which moves into the trash once this process no longer has it open."""
+
+    data_item_uuid: uuid.UUID
+    """The uuid of the removed data item, by which a restore finds the file."""
+
+    file_path: pathlib.Path
+    """The path of the file, which stays there until it moves."""
+
+    trash_file_path: pathlib.Path
+    """The path in the trash to which the file moves."""
+
+
 class HDF5RetiredFiles:
-    """Open HDF5 files which their handlers have replaced while a data handle over the file is held.
+    """Open HDF5 files which their handlers have replaced or removed while a data handle over the file is held.
 
     A retired file stays open so that the holders of its data handle keep reading its data. When the last holder drops
     the handle, a finalizer queues the file, and close_released_files closes it on the main thread. Close closes every
     retired file, whether or not its holders have gone.
+
+    A removed file stays at its path, marked removed, until it is closed. Then close_released_files and close move it
+    into the trash; a move which is refused is tried again at the next pass. A restore before the move takes the file
+    back, and it is then only closed.
     """
 
     def __init__(self) -> None:
@@ -190,22 +291,40 @@ class HDF5RetiredFiles:
         # the retired files whose last holder has gone. a finalizer may run on any thread, inside unrelated code, so it
         # only appends; deque appends and pops are thread safe, and only the main thread pops.
         self.__released_files: collections.deque[HDF5FileEntry] = collections.deque()
+        # the removed files not yet moved into the trash, by data item uuid. the lock protects the dict.
+        self.__removed_files: dict[uuid.UUID, HDF5RemovedFile] = dict()
 
     def retire(self, file: HDF5FileEntry, data_handle: DataHandle.DataHandle) -> None:
         # may be called on any thread.
         with self.__lock:
             self.__retired_files[file] = weakref.finalize(data_handle, self.__released_files.append, file)
 
+    def add_removed_file(self, removed_file: HDF5RemovedFile) -> None:
+        # main thread only. the file moves into the trash at the first pass after nothing in this process has it open.
+        with self.__lock:
+            self.__removed_files[removed_file.data_item_uuid] = removed_file
+
+    def restore_removed_file(self, data_item_uuid: uuid.UUID) -> pathlib.Path | None:
+        """Take back the removed file of the data item, which then stays where it is; return its path, or None.
+
+        Main thread only.
+        """
+        with self.__lock:
+            removed_file = self.__removed_files.pop(data_item_uuid, None)
+        return removed_file.file_path if removed_file else None
+
     def close_released_files(self) -> None:
-        # main thread only.
+        # main thread only. close the files whose last holder has gone, then move the removed files which are closed.
         while self.__released_files:
             file = self.__released_files.popleft()
             with self.__lock:
                 self.__retired_files.pop(file, None)
             file.close()
+        self.__move_removed_files()
 
     def close(self) -> None:
-        # main thread only.
+        # main thread only. a removed file whose move is refused stays at its path, marked removed, and the next load
+        # deletes it.
         with self.__lock:
             retired_files = self.__retired_files
             self.__retired_files = dict()
@@ -213,6 +332,24 @@ class HDF5RetiredFiles:
             finalizer.detach()
             file.close()
         self.__released_files.clear()
+        self.__move_removed_files()
+        with self.__lock:
+            self.__removed_files.clear()
+
+    def __move_removed_files(self) -> None:
+        # main thread only. move the removed files which this process no longer has open into the trash. a file whose
+        # move is refused stays in the removed files, to be tried again at the next pass.
+        with self.__lock:
+            removed_files = list(self.__removed_files.values())
+        for removed_file in removed_files:
+            if not HDF5FileEntry.is_path_open(removed_file.file_path):
+                try:
+                    if removed_file.file_path.exists():
+                        move_data_file_to_trash(removed_file.file_path, removed_file.trash_file_path, reason=f"data item {removed_file.data_item_uuid} removed")
+                except OSError:
+                    continue
+                with self.__lock:
+                    self.__removed_files.pop(removed_file.data_item_uuid, None)
 
 
 class HDF5IdleFiles:
@@ -485,14 +622,47 @@ class HDF5Handler(StorageHandler.StorageHandler):
                 os.remove(self.__file_path)
                 data_files_logger.debug("data file deleted: %s, file type HDF5", self.__file_path)
 
+    def release_for_removal(self, trash_file_path: pathlib.Path) -> bool:
+        """Give up the file for a removal which can be undone; return whether it is left to the retired files.
+
+        A file whose data handle is held is marked removed and retired, so that it stays open at its path for its holders,
+        who can no longer write it, and moves to trash_file_path after the last holder lets go. Otherwise the file is
+        closed, for the caller to move.
+        """
+        with self.__lock:
+            if self.__get_data_handle() is None:
+                self.__release_file()
+                return False
+            self.__retired_files.add_removed_file(self.__mark_removed(trash_file_path))
+            self.__release_file(is_removed=True)
+            return True
+
+    def retire_removed_file(self, trash_file_path: pathlib.Path) -> None:
+        """Mark the file removed and leave it to the retired files, which move it to trash_file_path at a later pass.
+
+        For a removal whose move into the trash is refused. The file is closed again afterwards.
+        """
+        with self.__lock:
+            removed_file = self.__mark_removed(trash_file_path)
+            self.__release_file()
+            self.__retired_files.add_removed_file(removed_file)
+
+    # mark the current file removed in its properties, leaving the rest of them as they are, and return its removed file.
+    def __mark_removed(self, trash_file_path: pathlib.Path) -> HDF5RemovedFile:
+        self.__ensure_dataset()
+        data_item_uuid = _mark_dataset_removed(self.__dataset)
+        self.__file.fp.flush()
+        return HDF5RemovedFile(data_item_uuid, pathlib.Path(self.__file_path), trash_file_path)
+
     # give up the current file. a file whose data handle is held is retired, so that its holders keep reading its data
-    # but can no longer write it. otherwise the file is closed. either way the handler continues with a new file entry
-    # at its path, opened when next used, so that the earlier file, if queued as idle, no longer matches.
-    def __release_file(self) -> None:
+    # but can no longer write it; on Windows only a removed file is. otherwise the file is closed. either way the handler
+    # continues with a new file entry at its path, opened when next used, so that the earlier file, if queued as idle,
+    # no longer matches.
+    def __release_file(self, *, is_removed: bool = False) -> None:
         data_handle = self.__get_data_handle()
         self.__dataset = None
         self.__data_handle_ref = None
-        if data_handle is not None and _retire_held_files:
+        if data_handle is not None and (is_removed or _retire_held_files):
             data_handle.mark_replaced()
             self.__retired_files.retire(self.__file, data_handle)
         else:
