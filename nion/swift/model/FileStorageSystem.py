@@ -663,7 +663,7 @@ class ProjectStorageSystem(PersistentStorageSystem):
         self.__storage_adapter_map.clear()
 
     def close_released_files(self) -> None:
-        """Close the data files which nobody holds or has used for a while, and do the moves waiting for them. Main thread only."""
+        """Close the data files which nobody holds or has used for a while, and do the moves, deletes and replacements waiting for them. Main thread only."""
         pass
 
     @abc.abstractmethod
@@ -1028,22 +1028,23 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         self.__project_path = project_path
         self.__project_data_path = project_data_path
         self.__large_format_size = large_format_size
-        # HDF5 files replaced while their data is held stay open here until their last holder goes or this closes.
-        self.__hdf5_retired_files = HDF5Handler.HDF5RetiredFiles()
+        # HDF5 files given up while in use, and files waiting to be renamed or deleted, until nothing has them open.
+        self.__hdf5_deferred_files = HDF5Handler.HDF5DeferredFiles()
         # current HDF5 files whose data nobody holds close here once idle.
         self.__hdf5_idle_files = HDF5Handler.HDF5IdleFiles(delay=idle_file_delay, clock=clock or time.monotonic)
-        self.__hdf5_handler_factory = HDF5Handler.HDF5HandlerFactory(self.__hdf5_retired_files, self.__hdf5_idle_files, file_locking=hdf5_file_locking)
+        self.__hdf5_handler_factory = HDF5Handler.HDF5HandlerFactory(self.__hdf5_deferred_files, self.__hdf5_idle_files, file_locking=hdf5_file_locking)
         self._file_handler_factories = [NDataHandler.NDataHandlerFactory(), self.__hdf5_handler_factory]
-        # the files of data items restored where they are, by data item uuid, until the data items are inserted.
-        self.__restored_file_paths: dict[uuid.UUID, pathlib.Path] = dict()
+        # the files of data items restored where they are, by data item uuid, until the data items are inserted: the
+        # canonical file, and the pending file which replaces it, if any. main thread only.
+        self.__restored_file_paths: dict[uuid.UUID, tuple[pathlib.Path, pathlib.Path | None]] = dict()
 
     def close(self) -> None:
         super().close()
-        self.__hdf5_retired_files.close()
+        self.__hdf5_deferred_files.close()
         self.__hdf5_idle_files.close()
 
     def close_released_files(self) -> None:
-        self.__hdf5_retired_files.close_released_files()
+        self.__hdf5_deferred_files.close_released_files()
         self.__hdf5_idle_files.close_idle_files()
 
     def normalize_project_data_path(self) -> None:
@@ -1153,12 +1154,16 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         assert self.__project_data_path is not None
         # a removed file which has not yet moved into the trash is restored where it is: its marker is removed, and it
         # becomes the data item's file again when the data item is inserted, while its earlier holders keep reading it.
-        if (file_path := self.__hdf5_retired_files.restore_removed_file(data_item_uuid)) is not None:
-            with contextlib.closing(self.__hdf5_handler_factory.make(file_path)) as storage_handler:
-                storage_handler_properties = storage_handler.read_properties()
-                storage_handler_properties["version"] = DataItem.DataItem.writer_version
-                storage_handler.write_properties(storage_handler_properties, datetime.datetime.now())
-            self.__restored_file_paths[data_item_uuid] = file_path
+        # a removed pending file becomes the pending file of the data item's canonical file again; the canonical file,
+        # if it is still there, holds the previous data, and is kept and unmarked until the pending file replaces it.
+        if (removed_file := self.__hdf5_deferred_files.restore_removed_file(data_item_uuid)) is not None:
+            storage_handler_properties = self.__unmark_removed_file(removed_file.file_path)
+            if removed_file.canonical_file_path is not None:
+                self.__keep_removed_canonical_file(removed_file.canonical_file_path)
+            if removed_file.canonical_file_path is not None:
+                self.__restored_file_paths[data_item_uuid] = (removed_file.canonical_file_path, removed_file.file_path)
+            else:
+                self.__restored_file_paths[data_item_uuid] = (removed_file.file_path, None)
             return Migration.transform_to_latest(storage_handler_properties)
         trash_dir = self.__project_data_path / "trash"
         # a data file in the trash is normally named for its data item, so only that file is read. files named
@@ -1167,6 +1172,21 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         if (properties := self.__restore_item_from_storage_handlers(self.__make_storage_handlers(named_file_paths), data_item_uuid)) is not None:
             return properties
         return self.__restore_item_from_storage_handlers(self.__find_storage_handlers(trash_dir, skip_trash=False), data_item_uuid)
+
+    def __unmark_removed_file(self, file_path: pathlib.Path) -> PersistentDictType:
+        # set the version in the properties of the HDF5 file back to the one this version writes; return the properties.
+        with contextlib.closing(self.__hdf5_handler_factory.make(file_path)) as storage_handler:
+            storage_handler_properties = storage_handler.read_properties()
+            storage_handler_properties["version"] = DataItem.DataItem.writer_version
+            storage_handler.write_properties(storage_handler_properties, datetime.datetime.now())
+        return storage_handler_properties
+
+    def __keep_removed_canonical_file(self, file_path: pathlib.Path) -> None:
+        # keep the canonical file of a restored pending file, which is marked removed or waits to be deleted. it holds
+        # the previous data, consistent with its properties, until the pending file replaces it.
+        self.__hdf5_deferred_files.keep_file(file_path)
+        if file_path.exists():
+            self.__unmark_removed_file(file_path)
 
     def __restore_item_from_storage_handlers(self, storage_handlers: typing.Sequence[StorageHandler.StorageHandler], data_item_uuid: uuid.UUID) -> typing.Optional[PersistentDictType]:
         # restore the data item from whichever storage handler holds it and close the storage handlers.
@@ -1197,7 +1217,15 @@ class FileProjectStorageSystem(ProjectStorageSystem):
                             # a refused rename still copies the file, so that the data item is at its path at the next load.
                             shutil.move(old_file_path, new_file_path)
                             data_files_logger.debug("data file moved: %s, data item %s, to %s, reason data item restored", old_file_path, data_item_uuid, new_file_path)
-                        self._make_storage_handler(make_storage_handler_attributes(data_item)).close()  # what's this line for?
+                        elif self.__hdf5_deferred_files.is_deleted_file(pathlib.Path(new_file_path)):
+                            # the data item's earlier file is still there, open for its holders, waiting to be deleted.
+                            # the file from the trash becomes a pending file which replaces it once it is closed. the
+                            # earlier file is kept first, so that a refusal leaves the file from the trash where it is.
+                            self.__keep_removed_canonical_file(pathlib.Path(new_file_path))
+                            pending_file_path, _ = HDF5Handler.find_pending_file_path(pathlib.Path(new_file_path), 1)
+                            storage_handler.prepare_move()  # moving files in the storage handler requires it to be closed.
+                            HDF5Handler.move_data_file(pathlib.Path(old_file_path), pending_file_path, reason=f"data item {data_item_uuid} restored")
+                            self.__restored_file_paths[data_item_uuid] = (pathlib.Path(new_file_path), pending_file_path)
                         return properties
         finally:
             for storage_handler in storage_handlers:
@@ -1239,7 +1267,10 @@ class FileProjectStorageSystem(ProjectStorageSystem):
             logging.getLogger("loader").warning(f"Unable to delete removed data file {storage_handler.reference} ({e}).")
 
     def _take_restored_storage_handler(self, data_item_uuid: uuid.UUID) -> StorageHandler.StorageHandler | None:
-        if (file_path := self.__restored_file_paths.pop(data_item_uuid, None)) is not None:
+        if (restored_file_paths := self.__restored_file_paths.pop(data_item_uuid, None)) is not None:
+            file_path, pending_file_path = restored_file_paths
+            if pending_file_path is not None:
+                return self.__hdf5_handler_factory.make_pending(file_path, pending_file_path)
             return self.__hdf5_handler_factory.make(file_path)
         return None
 
