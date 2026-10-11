@@ -251,6 +251,9 @@ class UndeleteDataItem(Changes.UndeleteBase):
     def close(self) -> None:
         pass
 
+    def check_undelete(self, document_model: DocumentModel) -> None:
+        document_model._project.project_storage_system.check_restore_item(self.data_item_uuid)
+
     def undelete(self, document_model: DocumentModel) -> None:
         document_model.restore_data_item(self.data_item_uuid, self.index)
 

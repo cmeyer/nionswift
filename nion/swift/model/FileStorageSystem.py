@@ -21,6 +21,7 @@ import typing
 import uuid
 
 from nion.data import DataAndMetadata
+from nion.swift.model import Changes
 from nion.swift.model import DataHandle
 from nion.swift.model import DataItem
 from nion.swift.model import HDF5Handler
@@ -555,6 +556,9 @@ class PersistentStorageSystem(Persistence.PersistentStorageInterface):
 
     def rewrite_item(self, item: Persistence.PersistentObject) -> None:
         self.__write_properties_if_not_delayed(item)
+
+    def check_restore_item(self, data_item_uuid: uuid.UUID) -> None:
+        """Raise Changes.UndeleteRefusedError if restore_item would be refused."""
 
     def restore_item(self, data_item_uuid: uuid.UUID) -> typing.Optional[PersistentDictType]:
         raise NotImplementedError()
@@ -1157,9 +1161,14 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         # a removed pending file becomes the pending file of the data item's canonical file again; the canonical file,
         # if it is still there, holds the previous data, and is kept and unmarked until the pending file replaces it.
         if (removed_file := self.__hdf5_deferred_files.restore_removed_file(data_item_uuid)) is not None:
-            storage_handler_properties = self.__unmark_removed_file(removed_file.file_path)
-            if removed_file.canonical_file_path is not None:
-                self.__keep_removed_canonical_file(removed_file.canonical_file_path)
+            try:
+                storage_handler_properties = self.__unmark_removed_file(removed_file.file_path)
+                if removed_file.canonical_file_path is not None:
+                    self.__keep_removed_canonical_file(removed_file.canonical_file_path)
+            except Changes.UndeleteRefusedError:
+                # the removal stands, and a later undo tries again.
+                self.__hdf5_deferred_files.add_removed_file(removed_file)
+                raise
             if removed_file.canonical_file_path is not None:
                 self.__restored_file_paths[data_item_uuid] = (removed_file.canonical_file_path, removed_file.file_path)
             else:
@@ -1173,20 +1182,76 @@ class FileProjectStorageSystem(ProjectStorageSystem):
             return properties
         return self.__restore_item_from_storage_handlers(self.__find_storage_handlers(trash_dir, skip_trash=False), data_item_uuid)
 
+    def check_restore_item(self, data_item_uuid: uuid.UUID) -> None:
+        # the restore writes the removed file, and the canonical file of a removed pending file, whether or not the pending
+        # file has moved into the trash, unless the canonical file's mark was refused. it also opens the data item's HDF5
+        # file in the trash for writing and moves it back. each file is renamed before it is opened, since Windows refuses
+        # a rename while another program has the file open, and h5py raises a plain OSError for such a file there, as it
+        # does for a damaged one.
+        assert self.__project_data_path is not None
+        data_file_stem = self.__get_data_file_stem(data_item_uuid)
+        canonical_file_name = data_file_stem + ".h5"
+        trash_dir = self.__project_data_path / "trash"
+        # each of the data item's files in the trash is renamed to a hidden name and back, which another program refuses as
+        # it would refuse the move. a crash between the renames leaves the hidden file in the trash, which the next load
+        # deletes with the rest of the trash, as earlier versions do too. a hidden file which refused the rename back is
+        # named back first.
+        for file_handler_factory in self._file_handler_factories:
+            file_path = trash_dir / (data_file_stem + file_handler_factory.get_extension())
+            hidden_file_path = file_path.with_name("." + file_path.name)
+            if hidden_file_path.exists() and not file_path.exists():
+                self.__rename_restore_file(hidden_file_path, file_path, file_path)
+            if file_path.exists():
+                self.__rename_restore_file(file_path, hidden_file_path, file_path)
+                self.__rename_restore_file(hidden_file_path, file_path, file_path)
+        # each file at its path is renamed to its own name, which changes nothing on disk. a file which this process has
+        # open isn't renamed, since Windows refuses that rename for this process's own handle too, which the restore's
+        # writes share.
+        file_paths = list(self.__hdf5_deferred_files.get_restore_file_paths(data_item_uuid, canonical_file_name))
+        for file_path in file_paths:
+            if not HDF5Handler.HDF5FileEntry.is_path_open(file_path):
+                self.__rename_restore_file(file_path, file_path, file_path)
+        if (trash_file_path := trash_dir / canonical_file_name).exists():
+            file_paths.append(trash_file_path)
+        # on macOS and Linux a lock doesn't refuse a rename, and h5py raises BlockingIOError for an HDF5 file lock which
+        # another program holds.
+        for file_path in file_paths:
+            try:
+                self.__hdf5_handler_factory.check_file_writable(file_path)
+            except (PermissionError, BlockingIOError) as e:
+                raise Changes.UndeleteRefusedError(file_path) from e
+
+    # rename a file which the restore needs, or raise UndeleteRefusedError with the file's visible path, which a file
+    # browser shows.
+    def __rename_restore_file(self, file_path: pathlib.Path, new_file_path: pathlib.Path, visible_file_path: pathlib.Path) -> None:
+        try:
+            os.rename(file_path, new_file_path)
+        except PermissionError as e:
+            raise Changes.UndeleteRefusedError(visible_file_path) from e
+
     def __unmark_removed_file(self, file_path: pathlib.Path) -> PersistentDictType:
         # set the version in the properties of the HDF5 file back to the one this version writes; return the properties.
-        with contextlib.closing(self.__hdf5_handler_factory.make(file_path)) as storage_handler:
-            storage_handler_properties = storage_handler.read_properties()
-            storage_handler_properties["version"] = DataItem.DataItem.writer_version
-            storage_handler.write_properties(storage_handler_properties, datetime.datetime.now())
+        try:
+            with contextlib.closing(self.__hdf5_handler_factory.make(file_path)) as storage_handler:
+                storage_handler_properties = storage_handler.read_properties()
+                storage_handler_properties["version"] = DataItem.DataItem.writer_version
+                storage_handler.write_properties(storage_handler_properties, datetime.datetime.now())
+        except (PermissionError, BlockingIOError) as e:
+            raise Changes.UndeleteRefusedError(file_path) from e
         return storage_handler_properties
 
     def __keep_removed_canonical_file(self, file_path: pathlib.Path) -> None:
         # keep the canonical file of a restored pending file, which is marked removed or waits to be deleted. it holds
         # the previous data, consistent with its properties, until the pending file replaces it.
-        self.__hdf5_deferred_files.keep_file(file_path)
-        if not self.__hdf5_deferred_files.forget_unmarked_file(file_path) and file_path.exists():
+        was_waiting_to_delete = self.__hdf5_deferred_files.keep_file(file_path)
+        if self.__hdf5_deferred_files.forget_unmarked_file(file_path) or not file_path.exists():
+            return
+        try:
             self.__unmark_removed_file(file_path)
+        except Changes.UndeleteRefusedError:
+            if was_waiting_to_delete:
+                self.__hdf5_deferred_files.delete_file(file_path)
+            raise
 
     def __restore_item_from_storage_handlers(self, storage_handlers: typing.Sequence[StorageHandler.StorageHandler], data_item_uuid: uuid.UUID) -> typing.Optional[PersistentDictType]:
         # restore the data item from whichever storage handler holds it and close the storage handlers.
@@ -1214,9 +1279,7 @@ class FileProjectStorageSystem(ProjectStorageSystem):
                         if not os.path.exists(new_file_path):
                             os.makedirs(os.path.dirname(new_file_path), exist_ok=True)
                             storage_handler.prepare_move()  # moving files in the storage handler requires it to be closed.
-                            # a refused rename still copies the file, so that the data item is at its path at the next load.
-                            shutil.move(old_file_path, new_file_path)
-                            data_files_logger.debug("data file moved: %s, data item %s, to %s, reason data item restored", old_file_path, data_item_uuid, new_file_path)
+                            HDF5Handler.move_data_file(pathlib.Path(old_file_path), pathlib.Path(new_file_path), reason=f"data item {data_item_uuid} restored")
                         elif self.__hdf5_deferred_files.is_deleted_file(pathlib.Path(new_file_path)):
                             # the data item's earlier file is still there, open for its holders, waiting to be deleted.
                             # the file from the trash becomes a pending file which replaces it once it is closed. the
