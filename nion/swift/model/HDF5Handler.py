@@ -3,12 +3,14 @@
 """
 from __future__ import annotations
 
+import collections
 import datetime
 import io
 import json
 import logging
 import os
 import pathlib
+import sys
 import threading
 import typing
 import uuid
@@ -116,13 +118,23 @@ def get_write_chunk_shape_for_data(data_shape: DataAndMetadata.ShapeType, data_d
 
 _HDF5FilePointer = typing.Any
 
+# Windows refuses to delete or rename a file held open, so there a held file is closed under its holders.
+_retire_held_files = sys.platform != "win32"
+
 
 class HDF5FileEntry:
+    """An HDF5 file at a path, opened when first used and owned by one handler.
+
+    Each handler opens its own file, so closing it affects only that handler's data. The file may be opened again after
+    it is closed. The count of open files is kept for detecting unclosed files in tests.
+    """
+    _open_count = 0
+    __open_count_lock = threading.Lock()
+
     def __init__(self, path: pathlib.Path) -> None:
         self.__lock = threading.RLock()
         self.__path = path
         self.__fp: typing.Optional[_HDF5FilePointer] = None
-        self._count = 0
 
     @property
     def fp(self) -> _HDF5FilePointer:
@@ -136,81 +148,95 @@ class HDF5FileEntry:
             if not self.__fp:
                 self.__path.parent.mkdir(parents=True, exist_ok=True)
                 self.__fp = h5py.File(self.__path, "a")
+                with HDF5FileEntry.__open_count_lock:
+                    HDF5FileEntry._open_count += 1
 
     def close(self) -> None:
         with self.__lock:
             if self.__fp:
                 self.__fp.close()
+                with HDF5FileEntry.__open_count_lock:
+                    HDF5FileEntry._open_count -= 1
             self.__fp = None
 
 
-class HDF5FileManager:
+class HDF5RetiredFiles:
+    """Open HDF5 files which their handlers have replaced while a data handle over the file is held.
+
+    A retired file stays open so that the holders of its data handle keep reading its data. When the last holder drops
+    the handle, a finalizer queues the file, and close_released_files closes it on the main thread. Close closes every
+    retired file, whether or not its holders have gone.
+    """
+
     def __init__(self) -> None:
-        self.__file_entries: typing.Dict[pathlib.Path, HDF5FileEntry] = dict()
-        self.__lock = threading.RLock()
+        # the retired files and the finalizers of their data handles. files are retired on any thread; the lock protects
+        # the dict.
+        self.__lock = threading.Lock()
+        self.__retired_files: dict[HDF5FileEntry, weakref.finalize[[HDF5FileEntry], DataHandle.DataHandle]] = dict()
+        # the retired files whose last holder has gone. a finalizer may run on any thread, inside unrelated code, so it
+        # only appends; deque appends and pops are thread safe, and only the main thread pops.
+        self.__released_files: collections.deque[HDF5FileEntry] = collections.deque()
 
-    def _clear(self) -> None:
-        # for tests only
-        self.__file_entries.clear()
-
-    @property
-    def _open_count(self) -> int:
-        return len(self.__file_entries.items())
-
-    def open(self, path: pathlib.Path) -> HDF5FileEntry:
+    def retire(self, file: HDF5FileEntry, data_handle: DataHandle.DataHandle) -> None:
+        # may be called on any thread.
         with self.__lock:
-            if not path in self.__file_entries:
-                self.__file_entries[path] = HDF5FileEntry(path)
-            self.__file_entries[path]._count += 1
-            return self.__file_entries[path]
+            self.__retired_files[file] = weakref.finalize(data_handle, self.__released_files.append, file)
 
-    def close(self, path: pathlib.Path) -> None:
+    def close_released_files(self) -> None:
+        # main thread only.
+        while self.__released_files:
+            file = self.__released_files.popleft()
+            with self.__lock:
+                self.__retired_files.pop(file, None)
+            file.close()
+
+    def close(self) -> None:
+        # main thread only.
         with self.__lock:
-            self.__file_entries[path]._count -= 1
-            if self.__file_entries[path]._count == 0:
-                self.__file_entries.pop(path).close()
-
-    def force_close(self, path: pathlib.Path) -> None:
-        with self.__lock:
-            if path in self.__file_entries:
-                self.__file_entries[path].close()
-
-
-_file_manager = HDF5FileManager()
+            retired_files = self.__retired_files
+            self.__retired_files = dict()
+        for file, finalizer in retired_files.items():
+            finalizer.detach()
+            file.close()
+        self.__released_files.clear()
 
 
 class HDF5Handler(StorageHandler.StorageHandler):
     count = 0  # useful for detecting leaks in tests
-    open = 0  # useful for detecting unclosed files
 
-    def __init__(self, file_path: typing.Union[str, pathlib.Path]) -> None:
+    def __init__(self, file_path: str | pathlib.Path, retired_files: HDF5RetiredFiles | None = None) -> None:
         self.__file_path = str(file_path)
         self.__lock = threading.RLock()
-        self.__file = _file_manager.open(pathlib.Path(self.__file_path))
+        self.__file = HDF5FileEntry(pathlib.Path(self.__file_path))
         self.__dataset: typing.Any = None
         # the data handle handed out for the current dataset, while anyone holds it.
         self.__data_handle_ref: weakref.ReferenceType[DataHandle.DataHandle] | None = None
+        # files this handler replaces while their data handle is held go to the retired files of its storage system,
+        # which closes them after their last holder. a handler made without them closes its retired files when it closes.
+        self.__storage_retired_files = retired_files
+        self.__retired_files = retired_files if retired_files is not None else HDF5RetiredFiles()
         self._write_count = 0
         HDF5Handler.count += 1
 
     def close(self) -> None:
         HDF5Handler.count -= 1
-        self.__close_fp()
-        _file_manager.close(pathlib.Path(self.__file_path))
+        with self.__lock:
+            self.__release_file()
+        if self.__storage_retired_files is None:
+            self.__retired_files.close()
 
     @property
     def factory(self) -> StorageHandler.StorageHandlerFactoryLike:
-        return HDF5HandlerFactory()
+        return HDF5HandlerFactory(self.__storage_retired_files)
 
     @property
     def storage_handler_type(self) -> str:
         return "hdf5"
 
-    # called before the file is moved; close but don't count.
+    # called before the file is moved; give up the current file.
     def prepare_move(self) -> None:
         with self.__lock:
-            self.__close_fp()
-            _file_manager.force_close(pathlib.Path(self.__file_path))
+            self.__release_file()
 
     @property
     def reference(self) -> str:
@@ -268,7 +294,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
                 if self.__dataset.shape != data.shape or self.__dataset.dtype != data.dtype:
                     # case 2
                     json_properties = self.__dataset.attrs.get("properties", "")
-                    self.__close_fp()
+                    self.__release_file()
                     os.remove(self.__file_path)
                     data_files_logger.debug("data file deleted: %s, file type HDF5, reason data of another shape or dtype written", self.__file_path)
                     chunks = get_write_chunk_shape_for_data(data.shape, data.dtype, data_descriptor)
@@ -297,7 +323,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
                 if self.__dataset is None:
                     self.__dataset = self.__file.fp["data"]
                 json_properties = self.__dataset.attrs.get("properties", "")
-                self.__close_fp()
+                self.__release_file()
                 os.remove(self.__file_path)
                 data_files_logger.debug("data file deleted: %s, file type HDF5, reason data reserved", self.__file_path)
                 self.__file.open()
@@ -340,18 +366,30 @@ class HDF5Handler(StorageHandler.StorageHandler):
         return self.__data_handle_ref() if self.__data_handle_ref else None
 
     def remove(self) -> None:
-        self.__close_fp()
-        if os.path.isfile(self.__file_path):
-            os.remove(self.__file_path)
-            data_files_logger.debug("data file deleted: %s, file type HDF5", self.__file_path)
+        with self.__lock:
+            self.__release_file()
+            if os.path.isfile(self.__file_path):
+                os.remove(self.__file_path)
+                data_files_logger.debug("data file deleted: %s, file type HDF5", self.__file_path)
 
-    def __close_fp(self) -> None:
+    # give up the current file. a file whose data handle is held is retired, so that its holders keep reading its data,
+    # and the handler opens a new file at its path when next used. otherwise the file is closed.
+    def __release_file(self) -> None:
+        data_handle = self.__get_data_handle()
         self.__dataset = None
         self.__data_handle_ref = None
-        self.__file.close()
+        if data_handle is not None and _retire_held_files:
+            self.__retired_files.retire(self.__file, data_handle)
+            self.__file = HDF5FileEntry(pathlib.Path(self.__file_path))
+        else:
+            self.__file.close()
 
 
 class HDF5HandlerFactory(StorageHandler.StorageHandlerFactoryLike):
+
+    def __init__(self, retired_files: HDF5RetiredFiles | None = None) -> None:
+        # the retired files of the storage system which makes handlers with this factory, if any.
+        self.__retired_files = retired_files
 
     def get_storage_handler_type(self) -> str:
         return "hdf5"
@@ -362,7 +400,7 @@ class HDF5HandlerFactory(StorageHandler.StorageHandlerFactoryLike):
         return False
 
     def make(self, file_path: pathlib.Path) -> StorageHandler.StorageHandler:
-        return HDF5Handler(self.make_path(file_path))
+        return HDF5Handler(self.make_path(file_path), self.__retired_files)
 
     def make_path(self, file_path: pathlib.Path) -> str:
         return str(file_path.with_suffix(self.get_extension()))

@@ -649,6 +649,10 @@ class ProjectStorageSystem(PersistentStorageSystem):
             storage_adapter.close()
         self.__storage_adapter_map.clear()
 
+    def close_released_files(self) -> None:
+        """Close the files kept open for holders of data items' data whose last holder has gone. Main thread only."""
+        pass
+
     @abc.abstractmethod
     def _get_storage_handler_factory(self, storage_handler_attributes: StorageHandler.StorageHandlerAttributes) -> StorageHandler.StorageHandlerFactoryLike: ...
 
@@ -988,6 +992,16 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         self.__project_path = project_path
         self.__project_data_path = project_data_path
         self.__large_format_size = large_format_size
+        # HDF5 files replaced while their data is held stay open here until their last holder goes or this closes.
+        self.__hdf5_retired_files = HDF5Handler.HDF5RetiredFiles()
+        self._file_handler_factories = [NDataHandler.NDataHandlerFactory(), HDF5Handler.HDF5HandlerFactory(self.__hdf5_retired_files)]
+
+    def close(self) -> None:
+        super().close()
+        self.__hdf5_retired_files.close()
+
+    def close_released_files(self) -> None:
+        self.__hdf5_retired_files.close_released_files()
 
     def normalize_project_data_path(self) -> None:
         # in order to be resilient to name changes, first make a list of folders in project_data_folders which
