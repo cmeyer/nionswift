@@ -398,6 +398,23 @@ class HDF5DeferredFiles:
             return True
         return False
 
+    def get_restore_file_paths(self, data_item_uuid: uuid.UUID, canonical_file_name: str) -> typing.Sequence[pathlib.Path]:
+        """Return the files which a restore of the data item writes, of those these files know.
+
+        The canonical file of a pending file already in the trash waits to be deleted under canonical_file_name. Main thread only.
+        """
+        with self.__lock:
+            removed_file = self.__removed_files.get(data_item_uuid)
+            deleted_file_paths = list(self.__deleted_files.values())
+        file_paths = list[pathlib.Path]()
+        if removed_file is not None:
+            file_paths.append(removed_file.file_path)
+            if removed_file.canonical_file_path is not None:
+                file_paths.append(removed_file.canonical_file_path)
+        else:
+            file_paths.extend(file_path for file_path in deleted_file_paths if file_path.name == canonical_file_name)
+        return [file_path for file_path in file_paths if file_path not in self.__unmarked_files and file_path.exists()]
+
     def add_pending_file(self, pending_file_path: pathlib.Path, canonical_file_path: pathlib.Path, handler: HDF5Handler) -> None:
         # any thread, under the handler's lock. the handler completes the replacement when it can.
         with self.__lock:
@@ -1013,6 +1030,11 @@ class HDF5HandlerFactory(StorageHandler.StorageHandlerFactoryLike):
     def make_pending(self, file_path: pathlib.Path, pending_file_path: pathlib.Path) -> HDF5Handler:
         """Make a handler for the canonical file at file_path which starts pending on the file at pending_file_path."""
         return HDF5Handler(self.make_path(file_path), self.__deferred_files, self.__idle_files, pending_file_path=pending_file_path, file_locking=self.__file_locking)
+
+    def check_file_writable(self, file_path: pathlib.Path) -> None:
+        """Raise OSError if the HDF5 file at file_path refuses being opened for writing."""
+        with h5py.File(file_path, "r+", locking=None if self.__file_locking else False):
+            pass
 
     def make_path(self, file_path: pathlib.Path) -> str:
         return str(file_path.with_suffix(self.get_extension()))

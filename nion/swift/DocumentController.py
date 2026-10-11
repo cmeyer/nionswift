@@ -484,6 +484,14 @@ class DocumentController(Window.Window):
     def _register_ui_activity(self) -> None:
         self.__last_activity = time.time()
 
+    # report a data item which can't be restored, which stays removed, in a dialog which doesn't block.
+    def __show_undelete_refused_dialog(self, error: Changes.UndeleteRefusedError) -> None:
+        if self.app:
+            message = _("Nion Swift can't yet restore this data item, since it can't write or move the data file. Another program probably has the file "
+                        "open, such as a cloud sync client or a virus scanner. The data item stays removed. Try again once the program has let "
+                        "go of the file. If the project closes first, the removal is final.")
+            self.app.show_ok_dialog(_("Data Files In Use"), message + f"\n\n{error.file_path}")
+
     def restore_ui_state_and_geometry(self) -> None:
         # this is done only when the project is first loaded. it used to be done anytime the window was shown (via
         # about_to_show), which included times when it was restored from a minimized state. this led to quirky behavior
@@ -1173,7 +1181,10 @@ class DocumentController(Window.Window):
 
     def handle_undo(self) -> bool:
         if self.__undo_stack.can_undo:
-            self.__undo_stack.undo()
+            try:
+                self.__undo_stack.undo()
+            except Changes.UndeleteRefusedError as e:
+                self.__show_undelete_refused_dialog(e)
             self.__undo_stack_changed()
             return True
         return False
@@ -1183,7 +1194,10 @@ class DocumentController(Window.Window):
 
     def handle_redo(self) -> None:
         if self.__undo_stack.can_redo:
-            self.__undo_stack.redo()
+            try:
+                self.__undo_stack.redo()
+            except Changes.UndeleteRefusedError as e:
+                self.__show_undelete_refused_dialog(e)
             self.__undo_stack_changed()
 
     def get_redo_menu_item_state(self) -> UserInterface.MenuItemState:
