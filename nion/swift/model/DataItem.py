@@ -262,7 +262,9 @@ class DataItem(Persistence.PersistentObject):
             data_and_metadata = DataAndMetadata.new_data_and_metadata(data, timezone=self.timezone, timezone_offset=self.timezone_offset)
             self.increment_data_ref_count()
             try:
-                self.__set_data_and_metadata_direct(data_and_metadata)
+                data_modified = self.__stamp_data_metadata(data_and_metadata.data_metadata, None)
+                self.__assign_data_and_metadata(data_and_metadata)
+                self.__write_data_metadata_properties(data_and_metadata.data_metadata, data_modified)
             finally:
                 self.decrement_data_ref_count()
         self.__dynamic_title: typing.Optional[DynamicString.DynamicString] = None
@@ -517,8 +519,9 @@ class DataItem(Persistence.PersistentObject):
             self.property_changed("uuid", str(self.uuid))
             self.property_changed("version", DataItem.writer_version)
             self.exit_write_delay()
-            self.rewrite()
+            # the data goes before the properties which describe it.
             self.__write_data()
+            self.rewrite()
             self.__pending_write = False
 
     def __write_data(self) -> None:
@@ -536,14 +539,15 @@ class DataItem(Persistence.PersistentObject):
             if self.__data is not None and not isinstance(self.__data, numpy.ndarray) and self.persistent_object_context and not self.is_write_delayed:
                 self.__data = None
 
+    # write what changed while writes were delayed, the data before the properties which describe it.
     def _finish_pending_write(self) -> None:
         if self.__pending_write:
             self.write_data_if_not_delayed()
         else:
-            if self.modified_count > self.__write_delay_modified_count:
-                self.rewrite()
             if self.__write_delay_data_changed:
                 self.__write_data()
+            if self.modified_count > self.__write_delay_modified_count:
+                self.rewrite()
 
     def _transaction_state_entered(self) -> None:
         self.__in_transaction_state = True
@@ -1249,7 +1253,7 @@ class DataItem(Persistence.PersistentObject):
         with self.__data_ref_count_mutex:
             self.__data_metadata = data_metadata
 
-    # set the persistent values for the data metadata, once the item holds it.
+    # set the persistent values for the data metadata, once the item holds it and its storage holds the data.
     def __write_data_metadata_properties(self, data_metadata: DataAndMetadata.DataMetadata, data_modified: datetime.datetime) -> None:
         self._set_persistent_property_value("data_shape", data_metadata.data_shape)
         self._set_persistent_property_value("data_dtype", DtypeToStringConverter().convert(data_metadata.data_dtype))
@@ -1270,30 +1274,17 @@ class DataItem(Persistence.PersistentObject):
         self._set_persistent_property_value("metadata", self.__metadata)
         self._set_persistent_property_value("data_modified", data_modified)
 
-    # set the data metadata on the item, and the persistent values which describe it.
-    def __set_data_metadata_direct(self, data_metadata: DataAndMetadata.DataMetadata,
-                                   data_modified: typing.Optional[datetime.datetime] = None) -> None:
-        data_modified = self.__stamp_data_metadata(data_metadata, data_modified)
-        self.__assign_data_metadata(data_metadata)
-        self.__write_data_metadata_properties(data_metadata, data_modified)
-
-    # set the data and its metadata on the item and the persistent values which describe them, mark them changed, and
-    # record the session. the data and its metadata are set together under the mutex, so that a reader on another
-    # thread takes the new data with its metadata, never with the metadata it replaces.
-    def __set_data_and_metadata_direct(self, data_and_metadata: typing.Optional[DataAndMetadata.DataAndMetadata],
-                                       data_modified: typing.Optional[datetime.datetime] = None) -> None:
+    # set the data and its stamped data metadata on the item, mark them changed, and record the session. the data and
+    # its metadata are set together under the mutex, so that a reader on another thread takes the new data with its
+    # metadata, never with the metadata it replaces. the session goes before the data is written, since it decides
+    # where the storage puts a new file.
+    def __assign_data_and_metadata(self, data_and_metadata: DataAndMetadata.DataAndMetadata | None) -> None:
         assert self.__data_ref_count > 0
-        if data_and_metadata:
-            data_metadata = data_and_metadata.data_metadata
-            data_modified = self.__stamp_data_metadata(data_metadata, data_modified)
-            item_data_metadata = copy.deepcopy(data_metadata)
-            with self.__data_ref_count_mutex:
-                self.__data = data_and_metadata.data
-                self.__data_metadata = item_data_metadata
-            self.__write_data_metadata_properties(data_metadata, data_modified)
-        else:
-            with self.__data_ref_count_mutex:
-                self.__data = None
+        data_metadata = copy.deepcopy(data_and_metadata.data_metadata) if data_and_metadata else None
+        with self.__data_ref_count_mutex:
+            self.__data = data_and_metadata.data if data_and_metadata else None
+            if data_metadata:
+                self.__data_metadata = data_metadata
         self.__change_changed = True
         self.__change_data_changed = True
         if self._session_manager:
@@ -1309,6 +1300,7 @@ class DataItem(Persistence.PersistentObject):
         self.increment_data_ref_count()
         try:
             new_data_and_metadata: typing.Optional[DataAndMetadata.DataAndMetadata]
+            new_data_modified: datetime.datetime
             if data_and_metadata:
                 data = data_and_metadata.data
                 data_shape_and_dtype = data_and_metadata.data_shape_and_dtype
@@ -1320,14 +1312,18 @@ class DataItem(Persistence.PersistentObject):
                 timezone = data_and_metadata.timezone or Utility.get_local_timezone()
                 timezone_offset = data_and_metadata.timezone_offset or Utility.TimezoneMinutesToStringConverter().convert(Utility.local_utcoffset_minutes())
                 new_data_and_metadata = DataAndMetadata.DataAndMetadata(data=data, data_shape_and_dtype=data_shape_and_dtype, intensity_calibration=intensity_calibration, dimensional_calibrations=dimensional_calibrations, metadata=metadata, timestamp=timestamp, data_descriptor=data_descriptor, timezone=timezone, timezone_offset=timezone_offset)
+                new_data_modified = self.__stamp_data_metadata(new_data_and_metadata.data_metadata, data_modified)
             else:
                 new_data_and_metadata = None
-            self.__set_data_and_metadata_direct(new_data_and_metadata, data_modified)
+            self.__assign_data_and_metadata(new_data_and_metadata)
+            # the data is written with the new data descriptor, and its properties after it.
             if self.__data is not None:
                 if self.persistent_object_context and not self.is_write_delayed:
                     self.write_external_data("data", self.__data)
                     self.__drop_given_data_once_stored()
                     self.__data_and_metadata_unloadable = True
+            if new_data_and_metadata:
+                self.__write_data_metadata_properties(new_data_and_metadata.data_metadata, new_data_modified)
         finally:
             self.decrement_data_ref_count()
 
@@ -1366,6 +1362,8 @@ class DataItem(Persistence.PersistentObject):
         with self.data_source_changes():
             self.increment_data_ref_count()
             try:
+                # the properties of the data metadata are collected, and written once the data is.
+                property_writes: list[tuple[DataAndMetadata.DataMetadata, datetime.datetime]] = list()
                 if self.__data is None:
                     data: numpy.typing.NDArray[typing.Any] = numpy.zeros(data_metadata.data_shape, data_metadata.data_dtype)
                     data_shape_and_dtype = data_metadata.data_shape_and_dtype
@@ -1385,12 +1383,14 @@ class DataItem(Persistence.PersistentObject):
                                                                             data_descriptor=data_descriptor,
                                                                             timezone=timezone,
                                                                             timezone_offset=timezone_offset)
-                    self.__set_data_and_metadata_direct(new_data_and_metadata, data_modified)
+                    property_writes.append((new_data_and_metadata.data_metadata, self.__stamp_data_metadata(new_data_and_metadata.data_metadata, data_modified)))
+                    self.__assign_data_and_metadata(new_data_and_metadata)
                 if self.__data is not None:
                     date_modified = data_metadata.timestamp if self.__data_and_metadata_first_update_after_reserve else self.__data_metadata.timestamp if self.__data_metadata else None
                     self.__data_and_metadata_first_update_after_reserve = False
                     if update_metadata or date_modified:
-                        self.__set_data_metadata_direct(data_metadata, date_modified)
+                        property_writes.append((data_metadata, self.__stamp_data_metadata(data_metadata, date_modified)))
+                        self.__assign_data_metadata(data_metadata)
                     assert self.data_shape == data_metadata.data_shape
                     assert self.data_dtype == data_metadata.data_dtype
                     assert self.data_dtype == data_and_metadata.data_dtype, f"{self.data_dtype=} == {data_and_metadata.data_dtype=}"
@@ -1401,11 +1401,13 @@ class DataItem(Persistence.PersistentObject):
                     if self._session_manager:
                         session_id = self._session_manager.current_session_id
                         self.session_id = session_id
-                    # set data_shape as a way to update 'modified' property
-                    self._set_persistent_property_value("data_shape", self.data_shape)
                     if self.persistent_object_context and not self.is_write_delayed:
                         self.write_external_data("data", self.__data)
                         self.__data_and_metadata_unloadable = True
+                    for property_data_metadata, property_data_modified in property_writes:
+                        self.__write_data_metadata_properties(property_data_metadata, property_data_modified)
+                    # set data_shape as a way to update 'modified' property
+                    self._set_persistent_property_value("data_shape", self.data_shape)
             finally:
                 self.decrement_data_ref_count()
 
