@@ -14,6 +14,7 @@ import json
 import logging
 import pkgutil
 import threading
+import traceback
 import types
 import typing
 import uuid
@@ -42,6 +43,9 @@ from nion.utils import ReferenceCounting
 from nion.utils import Registry
 
 _ = gettext.gettext
+
+# the interval, in seconds, at which a document model closes the files of data items' data whose last holder has gone.
+CLOSE_RELEASED_FILES_INTERVAL = 1.0
 
 
 class Closeable(typing.Protocol):
@@ -528,6 +532,22 @@ class MappedItemManager(metaclass=Registry.Singleton):
         return None
 
 
+# close the document model's released files at each interval, for as long as it exists. runs on its event loop, on the
+# main thread. it holds the document model weakly while waiting, so that it never keeps the document model alive.
+async def _close_released_files_periodically(document_model_ref: weakref.ReferenceType[DocumentModel]) -> None:
+    while True:
+        await asyncio.sleep(CLOSE_RELEASED_FILES_INTERVAL)
+        document_model = document_model_ref()
+        if document_model is None:
+            return
+        try:
+            document_model.close_released_files()
+        except Exception:
+            # keep closing released files at later intervals.
+            traceback.print_exc()
+        del document_model
+
+
 class DocumentModel(Observable.Observable, ReferenceCounting.ReferenceCounted, DataItem.SessionManager):
     """Manages storage and dependencies between data items and other objects.
 
@@ -631,6 +651,9 @@ class DocumentModel(Observable.Observable, ReferenceCounting.ReferenceCounted, D
         for index, data_group in enumerate(self.__project.data_groups):
             self.__project_item_inserted("data_groups", data_group, index)
 
+        # close the files released by their holders regularly, whether or not a document controller is open.
+        self.__close_released_files_task = event_loop.create_task(_close_released_files_periodically(weakref.ref(self)))
+
         Registry.register_component(self, {"document_model"})
 
     def __resolve_display_item_specifier(self, display_item_specifier_d: Persistence._SpecifierType) -> typing.Optional[DisplayItem.DisplayItem]:
@@ -685,6 +708,13 @@ class DocumentModel(Observable.Observable, ReferenceCounting.ReferenceCounted, D
         while self.event_loop and self.__computation_tasks:
             self.event_loop.stop()
             self.event_loop.run_forever()
+
+        # stop closing released files before the project closes. the cancelled task ends when the event loop next runs,
+        # so run it here, unless it is already running, as it is when the document model closes from within a task.
+        self.__close_released_files_task.cancel()
+        while not self.__close_released_files_task.done() and not self.__event_loop.is_running() and not self.__event_loop.is_closed():
+            self.__event_loop.stop()
+            self.__event_loop.run_forever()
 
         # r_vars
         MappedItemManager().unregister_document(self)
@@ -1863,6 +1893,11 @@ class DocumentModel(Observable.Observable, ReferenceCounting.ReferenceCounted, D
             # occurring with the acquisition test dashboard when the results were deleted immediately after acquisition.
             if not data_item._closed:
                 data_item.update_to_pending_xdata()
+
+    def close_released_files(self) -> None:
+        """Close the files kept open for holders of data items' data whose last holder has gone."""
+        assert threading.current_thread() == threading.main_thread()
+        self._project.project_storage_system.close_released_files()
 
     # for testing
     def _get_pending_data_item_updates_count(self) -> int:
