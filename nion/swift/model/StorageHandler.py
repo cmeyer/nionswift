@@ -10,6 +10,7 @@ import numpy
 import numpy.typing
 
 from nion.data import DataAndMetadata
+from nion.swift.model import DataHandle
 
 
 PersistentDictType = typing.Dict[str, typing.Any]
@@ -63,16 +64,16 @@ class StorageHandler(typing.Protocol):
         """Read and return the persistent properties from storage."""
         ...
 
-    def read_data(self) -> typing.Optional[_NDArray]:
-        """Read and return the data array from storage, or None if not available."""
+    def read_data(self) -> _NDArray | DataHandle.DataHandle | None:
+        """Read and return the data array, or a data handle to it, from storage, or None if not available."""
         ...
 
     def write_properties(self, properties: PersistentDictType, file_datetime: datetime.datetime) -> None:
         """Write the given properties to storage with the specified file datetime."""
         ...
 
-    def write_data(self, data: _NDArray, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:
-        """Write the given data array and descriptor to storage with the specified file datetime."""
+    def write_data(self, data: _NDArray | DataHandle.DataHandle, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:
+        """Write the given data array, or the data of a data handle, and descriptor to storage with the specified file datetime."""
         ...
 
     def reserve_data(self, data_shape: typing.Tuple[int, ...], data_dtype: numpy.typing.DTypeLike, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:

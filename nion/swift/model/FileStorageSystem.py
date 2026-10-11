@@ -20,6 +20,7 @@ import typing
 import uuid
 
 from nion.data import DataAndMetadata
+from nion.swift.model import DataHandle
 from nion.swift.model import DataItem
 from nion.swift.model import HDF5Handler
 from nion.swift.model import Migration
@@ -124,7 +125,7 @@ class DataItemStorageAdapter:
         file_datetime = getattr(item, "created_local")
         self.__storage_handler.reserve_data(data_shape, data_dtype, data_descriptor, file_datetime)
 
-    def load_data(self, item: Persistence.PersistentObject) -> typing.Optional[_NDArray]:
+    def load_data(self, item: Persistence.PersistentObject) -> _NDArray | DataHandle.DataHandle | None:
         return self.__storage_handler.read_data()
 
 
@@ -926,7 +927,7 @@ class ProjectStorageSystem(PersistentStorageSystem):
             return storage.storage_handler.reference if storage else None
         return None
 
-    def __read_data_item_data(self, data_item: DataItem.DataItem) -> typing.Optional[_NDArray]:
+    def __read_data_item_data(self, data_item: DataItem.DataItem) -> _NDArray | DataHandle.DataHandle | None:
         storage_adapter = self.__storage_adapter_map.get(data_item.uuid)
         assert storage_adapter
         return storage_adapter.load_data(data_item)
@@ -1398,7 +1399,7 @@ class MemoryStorageHandler(StorageHandler.StorageHandler):
         self._write_properties_count += 1
         self.__data_properties_map[self.__uuid] = Utility.clean_dict(properties)
 
-    def write_data(self, data: _NDArray, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:
+    def write_data(self, data: _NDArray | DataHandle.DataHandle, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:
         self.__data_map[self.__uuid] = numpy.copy(data)
 
     def reserve_data(self, data_shape: typing.Tuple[int, ...], data_dtype: numpy.typing.DTypeLike, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:

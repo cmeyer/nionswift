@@ -1209,6 +1209,7 @@ class DataItem(Persistence.PersistentObject):
 
     def __load_data(self) -> None:
         if self.persistent_object_context and self.__data is None and self.__data_metadata:
+            # a data handle is typed as the array which data and metadata expects.
             self.__data = typing.cast(typing.Optional[_ImageDataType], self.read_external_data("data"))
 
     def __unload_data(self) -> None:
@@ -1330,10 +1331,10 @@ class DataItem(Persistence.PersistentObject):
                 data_metadata = DataAndMetadata.DataMetadata(data_shape_and_dtype=data_shape_and_dtype, data_descriptor=data_descriptor, metadata=self.metadata, timezone=timezone, timezone_offset=timezone_offset)
                 data_modified = self.__stamp_data_metadata(data_metadata, data_modified)
                 item_data_metadata = copy.deepcopy(data_metadata)
-                # the reserved data replaces the stored data. drop the loaded data, which may be the stored data, reserve,
-                # and load the reserved data with its metadata, all under the mutex, so that a reader on another thread
-                # waits for the reserve and then takes the reserved data with its metadata, never the data of one with
-                # the metadata of the other. the persistent properties follow, outside the mutex.
+                # the reserved data replaces the stored data. drop the loaded data, which may be a handle over the stored
+                # data, reserve, and load the reserved data with its metadata, all under the mutex, so that a reader on
+                # another thread waits for the reserve and then takes the reserved data with its metadata, never the
+                # data of one with the metadata of the other. the persistent properties follow, outside the mutex.
                 with self.__data_ref_count_mutex:
                     self.__data = None
                     self.reserve_external_data("data", data_shape, data_dtype, (data_descriptor.is_sequence, data_descriptor.collection_dimension_count, data_descriptor.datum_dimension_count))

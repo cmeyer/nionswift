@@ -12,12 +12,14 @@ import pathlib
 import threading
 import typing
 import uuid
+import weakref
 
 import h5py
 import numpy
 import numpy.typing
 
 from nion.data import DataAndMetadata
+from nion.swift.model import DataHandle
 from nion.swift.model import StorageHandler
 from nion.swift.model import Utility
 from nion.utils import DateTime
@@ -186,6 +188,8 @@ class HDF5Handler(StorageHandler.StorageHandler):
         self.__lock = threading.RLock()
         self.__file = _file_manager.open(pathlib.Path(self.__file_path))
         self.__dataset: typing.Any = None
+        # the data handle handed out for the current dataset, while anyone holds it.
+        self.__data_handle_ref: weakref.ReferenceType[DataHandle.DataHandle] | None = None
         self._write_count = 0
         HDF5Handler.count += 1
 
@@ -245,7 +249,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
                     self.__dataset = self.__file.fp.create_dataset("data", data=numpy.empty((0,)))
                     data_files_logger.debug("data file created: %s, file type HDF5, shape %s, dtype %s", self.__file_path, self.__dataset.shape, self.__dataset.dtype)
 
-    def write_data(self, data: _NDArray, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:
+    def write_data(self, data: _NDArray | DataHandle.DataHandle, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:
         with self.__lock:
             assert data is not None
             json_properties = None
@@ -270,10 +274,12 @@ class HDF5Handler(StorageHandler.StorageHandler):
                     chunks = get_write_chunk_shape_for_data(data.shape, data.dtype, data_descriptor)
                     self.__dataset = self.__file.fp.require_dataset("data", shape=data.shape, dtype=data.dtype, chunks=chunks)
                     data_files_logger.debug("data file created: %s, file type HDF5, shape %s, dtype %s", self.__file_path, data.shape, data.dtype)
-            if id(data) == id(self.__dataset):
-                # the dataset already holds the data, written into the file through it, as a partial update is. this is
-                # on the path of each partial update, so it adds no more than the logger's own level check.
-                data_files_logger.debug("data written through its dataset: %s, file type HDF5", self.__file_path)
+            # the data may be the current dataset's own handle, which a data item writes back after a partial update
+            # through it.
+            if data is self.__get_data_handle():
+                # the handle already holds the data, written into the file through it, as a partial update is. this is on
+                # the path of each partial update, so it adds no more than the logger's own level check.
+                data_files_logger.debug("data written through its handle: %s, file type HDF5", self.__file_path)
             else:
                 self.__dataset[:] = data
                 self._write_count += 1
@@ -318,12 +324,20 @@ class HDF5Handler(StorageHandler.StorageHandler):
             json_properties = self.__dataset.attrs.get("properties", "")
             return typing.cast(PersistentDictType, json.loads(json_properties))
 
-    def read_data(self) -> typing.Optional[_NDArray]:
+    def read_data(self) -> DataHandle.DataHandle | None:
         with self.__lock:
             self.__ensure_dataset()
             if self.__dataset.shape == (0, ):
                 return None
-            return typing.cast(typing.Optional[_NDArray], self.__dataset)
+            data_handle = self.__get_data_handle()
+            if data_handle is None:
+                data_handle = DataHandle.DataHandle(self.__dataset)
+                self.__data_handle_ref = weakref.ref(data_handle)
+            return data_handle
+
+    # the data handle handed out for the current dataset, if it is still held.
+    def __get_data_handle(self) -> DataHandle.DataHandle | None:
+        return self.__data_handle_ref() if self.__data_handle_ref else None
 
     def remove(self) -> None:
         self.__close_fp()
@@ -333,6 +347,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
 
     def __close_fp(self) -> None:
         self.__dataset = None
+        self.__data_handle_ref = None
         self.__file.close()
 
 

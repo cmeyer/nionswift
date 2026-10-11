@@ -3,6 +3,7 @@ import datetime
 import os
 import pathlib
 import shutil
+import tempfile
 import unittest
 import uuid
 
@@ -96,3 +97,63 @@ class TestHDF5Handler(unittest.TestCase):
         finally:
             #logging.debug("rmtree %s", data_dir)
             shutil.rmtree(data_dir)
+
+    def test_data_handle_gives_the_values_of_the_stored_array(self):
+        stored = numpy.random.default_rng(41).random((6, 9, 13)).astype(numpy.float32)
+        mask = numpy.zeros(stored.shape, dtype=bool)
+        mask[1:3, 2:7, 4:12] = True
+        with tempfile.TemporaryDirectory() as directory:
+            handler = HDF5Handler.HDF5Handler(pathlib.Path(directory) / "data.h5")
+            with contextlib.closing(handler):
+                handler.write_data(stored, DataAndMetadata.DataDescriptor(False, 1, 2), datetime.datetime.now())
+                data_handle = handler.read_data()
+                assert data_handle is not None
+                self.assertEqual(stored.shape, data_handle.shape)
+                self.assertEqual(stored.dtype, data_handle.dtype)
+                self.assertEqual(stored.ndim, data_handle.ndim)
+                self.assertEqual(stored.size, data_handle.size)
+                self.assertEqual(stored.nbytes, data_handle.nbytes)
+                self.assertEqual(len(stored), len(data_handle))
+                self.assertTrue(numpy.array_equal(stored[2:5, 1:8], data_handle[2:5, 1:8]))
+                self.assertTrue(numpy.array_equal(stored[..., 3], data_handle[..., 3]))
+                self.assertEqual(stored[1, 2, 3], data_handle[1, 2, 3])
+                self.assertTrue(numpy.array_equal(stored[[1, 4]], data_handle[[1, 4]]))
+                self.assertTrue(numpy.array_equal(stored[mask], data_handle[mask]))
+                self.assertEqual(len(stored), len(list(data_handle)))
+                for stored_row, handle_row in zip(stored, data_handle):
+                    self.assertTrue(numpy.array_equal(stored_row, handle_row))
+                self.assertTrue(numpy.array_equal(stored, numpy.asarray(data_handle)))
+                self.assertTrue(numpy.allclose(numpy.sum(stored, axis=1), numpy.sum(data_handle, axis=1)))
+                as_float64 = data_handle.astype(numpy.float64)[2:4]
+                self.assertEqual(numpy.dtype(numpy.float64), as_float64.dtype)
+                self.assertTrue(numpy.array_equal(stored[2:4].astype(numpy.float64), as_float64))
+                self.assertTrue(numpy.array_equal(stored, data_handle.copy()))
+
+    def test_slice_of_data_handle_is_independent_of_the_stored_data(self):
+        stored = numpy.random.default_rng(41).random((6, 9)).astype(numpy.float32)
+        with tempfile.TemporaryDirectory() as directory:
+            handler = HDF5Handler.HDF5Handler(pathlib.Path(directory) / "data.h5")
+            with contextlib.closing(handler):
+                handler.write_data(stored, DataAndMetadata.DataDescriptor(False, 0, 2), datetime.datetime.now())
+                data_handle = handler.read_data()
+                assert data_handle is not None
+                data_slice = data_handle[1:4, 2:7]
+                self.assertIsInstance(data_slice, numpy.ndarray)
+                data_slice[:] = 0
+                self.assertTrue(numpy.array_equal(stored[1:4, 2:7], data_handle[1:4, 2:7]))
+
+    def test_writing_another_files_data_handle_copies_the_data(self):
+        stored = numpy.random.default_rng(41).random((6, 9)).astype(numpy.float32)
+        data_descriptor = DataAndMetadata.DataDescriptor(False, 0, 2)
+        with tempfile.TemporaryDirectory() as directory:
+            handler = HDF5Handler.HDF5Handler(pathlib.Path(directory) / "data.h5")
+            other_handler = HDF5Handler.HDF5Handler(pathlib.Path(directory) / "other.h5")
+            with contextlib.closing(handler), contextlib.closing(other_handler):
+                handler.write_data(stored, data_descriptor, datetime.datetime.now())
+                other_handler.write_data(numpy.zeros_like(stored), data_descriptor, datetime.datetime.now())
+                other_write_count = other_handler._write_count
+                data_handle = handler.read_data()
+                assert data_handle is not None
+                other_handler.write_data(data_handle, data_descriptor, datetime.datetime.now())
+                self.assertEqual(other_write_count + 1, other_handler._write_count)
+                self.assertTrue(numpy.array_equal(stored, numpy.asarray(other_handler.read_data())))
