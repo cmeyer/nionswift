@@ -316,11 +316,13 @@ class HDF5DeferredFiles:
     - a removed file moves into the trash. A restore before the move takes the file back, and it is then only closed;
     - a pending file replaces its canonical file once this process has closed both, or once its handler finds them free.
 
-    An operation which the file system refuses is tried again at the next pass. Close leaves what is still refused for
-    the next load.
+    An operation which the file system refuses is tried again at the next pass, including the mark of the canonical file
+    of a removed pending file. Close leaves what is still refused for the next load.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, file_locking: bool = True) -> None:
+        # whether HDF5 locks the files opened here.
+        self.__file_locking = file_locking
         # the retired files and the finalizers of their data handles. files are retired on any thread; the lock protects
         # the dict, and the dicts below.
         self.__lock = threading.Lock()
@@ -332,6 +334,9 @@ class HDF5DeferredFiles:
         self.__removed_files: dict[uuid.UUID, HDF5RemovedFile] = dict()
         # the files to delete once nothing in this process has them open, by open path key.
         self.__deleted_files: dict[str, pathlib.Path] = dict()
+        # the canonical files of removed pending files whose mark was refused, until they are marked, deleted or restored.
+        # main thread only.
+        self.__unmarked_files: set[pathlib.Path] = set()
         # the pending files, each with its canonical file and a weak reference to the handler whose current file it is,
         # or None once that handler has closed and left the replacement to these files.
         self.__pending_files: dict[pathlib.Path, tuple[pathlib.Path, weakref.ReferenceType[HDF5Handler] | None]] = dict()
@@ -381,6 +386,18 @@ class HDF5DeferredFiles:
         with self.__lock:
             return self.__removed_files.pop(data_item_uuid, None)
 
+    def add_unmarked_file(self, file_path: pathlib.Path) -> None:
+        # main thread only. the file refused its mark, which is tried again at each pass.
+        self.__unmarked_files.add(file_path)
+
+    def forget_unmarked_file(self, file_path: pathlib.Path) -> bool:
+        # main thread only. the file no longer needs its mark. return whether it was waiting for one, in which case it
+        # has none.
+        if file_path in self.__unmarked_files:
+            self.__unmarked_files.remove(file_path)
+            return True
+        return False
+
     def add_pending_file(self, pending_file_path: pathlib.Path, canonical_file_path: pathlib.Path, handler: HDF5Handler) -> None:
         # any thread, under the handler's lock. the handler completes the replacement when it can.
         with self.__lock:
@@ -405,13 +422,15 @@ class HDF5DeferredFiles:
             with self.__lock:
                 self.__retired_files.pop(file, None)
             file.close()
+        self.__mark_unmarked_files()
         self.__delete_files()
         self.__move_removed_files()
         self.__complete_pending_files()
 
     def close(self) -> None:
         # main thread only, after the handlers have closed. what is still refused stays for the next load: a removed
-        # file stays at its path, marked removed, and the load deletes it; a pending file and a file to delete stay.
+        # file stays at its path, marked removed, and the load deletes it; a pending file and a file to delete stay; a
+        # canonical file which still refuses its mark stays, and the load loads it.
         with self.__lock:
             retired_files = self.__retired_files
             self.__retired_files = dict()
@@ -419,13 +438,30 @@ class HDF5DeferredFiles:
             finalizer.detach()
             file.close()
         self.__released_files.clear()
+        self.__mark_unmarked_files()
         self.__delete_files()
         self.__move_removed_files()
         self.__complete_pending_files()
+        for file_path in self.__unmarked_files:
+            if file_path.exists():
+                logging.getLogger("loader").warning(f"Unable to mark data file {file_path} removed. Its removed data item comes back at the next load, with no display item.")
+        self.__unmarked_files.clear()
         with self.__lock:
             self.__removed_files.clear()
             self.__deleted_files.clear()
             self.__pending_files.clear()
+
+    def __mark_unmarked_files(self) -> None:
+        # main thread only. mark the canonical files which refused it, so that no version loads them after a crash or a
+        # close. a file which is gone needs no mark.
+        for file_path in list(self.__unmarked_files):
+            if file_path.exists():
+                try:
+                    _mark_file_removed(file_path, file_locking=self.__file_locking)
+                except OSError as e:
+                    data_files_logger.debug("data file mark refused, to be tried again: %s, error %s", file_path, e)
+                    continue
+            self.__unmarked_files.remove(file_path)
 
     def __delete_files(self) -> None:
         # main thread only. delete the files which this process no longer has open. a file whose delete is refused stays
@@ -910,9 +946,14 @@ class HDF5Handler(StorageHandler.StorageHandler):
     # under the lock, on the main thread.
     def __release_pending_for_removal(self, trash_file_path: pathlib.Path) -> None:
         # the canonical file is marked removed, so that no version loads it after a crash. it is deleted once the pending
-        # file has moved into the trash, so that a restore before then finds both files.
+        # file has moved into the trash, so that a restore before then finds both files. another program may refuse the
+        # mark, as it does the replace which this removal follows, and the deferred files then try it again.
         if self.__canonical_file_path.is_file():
-            _mark_file_removed(self.__canonical_file_path, file_locking=self.__file_locking)
+            try:
+                _mark_file_removed(self.__canonical_file_path, file_locking=self.__file_locking)
+            except OSError as e:
+                data_files_logger.debug("data file mark refused, to be tried again: %s, error %s", self.__canonical_file_path, e)
+                self.__deferred_files.add_unmarked_file(self.__canonical_file_path)
         # the pending file is hidden, so it is not marked removed. it moves into the trash under the canonical name, where
         # a restore finds it, now if it isn't held and the move isn't refused, otherwise once it is closed.
         self.__ensure_dataset()
