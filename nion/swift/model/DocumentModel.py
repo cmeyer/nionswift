@@ -45,6 +45,9 @@ from nion.utils import Registry
 
 _ = gettext.gettext
 
+# the log of data file management, which FileStorageSystem describes.
+data_files_logger = logging.getLogger("nion.swift.data_files")
+
 # the interval, in seconds, at which a document model closes the data files which nobody holds or has used for a while,
 # and does the moves, deletes and replacements waiting for them.
 CLOSE_RELEASED_FILES_INTERVAL = 1.0
@@ -1911,8 +1914,8 @@ class DocumentModel(Observable.Observable, ReferenceCounting.ReferenceCounted, D
         # file replaces its file while the data item is displayed.
         for data_item_uuid in project_storage_system.get_data_item_uuids_holding_pending_files():
             data_item = project.get_item_by_uuid("data_items", data_item_uuid)
-            if isinstance(data_item, DataItem.DataItem):
-                data_item.drop_loaded_data(functools.partial(project_storage_system.complete_pending_file, data_item_uuid))
+            if isinstance(data_item, DataItem.DataItem) and data_item.drop_loaded_data(functools.partial(project_storage_system.complete_pending_file, data_item_uuid)):
+                data_files_logger.debug("loaded data dropped for its pending replacement: data item %s", data_item_uuid)
         project_storage_system.close_released_files()
         if stuck_replacements := project_storage_system.take_stuck_data_file_replacements():
             stuck_data_files = list[tuple[pathlib.Path, DataItem.DataItem | None]]()
