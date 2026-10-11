@@ -45,7 +45,7 @@ from nion.utils import Registry
 _ = gettext.gettext
 
 # the interval, in seconds, at which a document model closes the data files which nobody holds or has used for a while,
-# and does the moves waiting for them.
+# and does the moves, deletes and replacements waiting for them.
 CLOSE_RELEASED_FILES_INTERVAL = 1.0
 
 
@@ -1896,7 +1896,7 @@ class DocumentModel(Observable.Observable, ReferenceCounting.ReferenceCounted, D
                 data_item.update_to_pending_xdata()
 
     def close_released_files(self) -> None:
-        """Close the data files which nobody holds or has used for a while, and do the moves waiting for them."""
+        """Close the data files which nobody holds or has used for a while, and do the moves, deletes and replacements waiting for them."""
         assert threading.current_thread() == threading.main_thread()
         self._project.project_storage_system.close_released_files()
 

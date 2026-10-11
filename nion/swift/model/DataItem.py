@@ -519,7 +519,8 @@ class DataItem(Persistence.PersistentObject):
             self.property_changed("uuid", str(self.uuid))
             self.property_changed("version", DataItem.writer_version)
             self.exit_write_delay()
-            # the data goes before the properties which describe it.
+            # the data goes before the properties which describe it, so that they go into the file which holds it, such
+            # as the pending file of HDF5 data of a new shape.
             self.__write_data()
             self.rewrite()
             self.__pending_write = False
@@ -539,7 +540,8 @@ class DataItem(Persistence.PersistentObject):
             if self.__data is not None and not isinstance(self.__data, numpy.ndarray) and self.persistent_object_context and not self.is_write_delayed:
                 self.__data = None
 
-    # write what changed while writes were delayed, the data before the properties which describe it.
+    # write what changed while writes were delayed, the data before the properties which describe it, so that they go
+    # into the file which holds it.
     def _finish_pending_write(self) -> None:
         if self.__pending_write:
             self.write_data_if_not_delayed()
