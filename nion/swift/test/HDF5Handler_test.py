@@ -249,3 +249,58 @@ class TestHDF5Handler(unittest.TestCase):
                     if hasattr(os, "chflags"):
                         os.chflags(file_path, 0)
             self.assertFalse(new_file_path.exists())
+
+    def test_pending_replacement_is_skipped_while_its_handler_is_in_use_on_another_thread_and_completes_once_free(self):
+        # data which another thread writes, and which waits for an event when the write reads it, so that the write holds
+        # the handler busy for as long as the test needs, as a long write does.
+        class WaitingData:
+            def __init__(self, data: numpy.ndarray, reading_event: threading.Event, release_event: threading.Event) -> None:
+                self.data = data
+                self.shape = data.shape
+                self.dtype = data.dtype
+                self.reading_event = reading_event
+                self.release_event = release_event
+
+            def __array__(self, dtype: numpy.typing.DTypeLike = None, copy: bool | None = None) -> numpy.ndarray:
+                self.reading_event.set()
+                # the timeout only keeps a failing test from hanging.
+                self.release_event.wait(10.0)
+                return self.data.astype(dtype) if dtype is not None else self.data
+
+        data_descriptor = DataAndMetadata.DataDescriptor(False, 0, 2)
+        deferred_files = HDF5Handler.HDF5DeferredFiles()
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = pathlib.Path(directory) / "data.h5"
+            handler = HDF5Handler.HDF5Handler(file_path, deferred_files)
+            with contextlib.closing(handler):
+                handler.write_data(numpy.zeros((5, 7), numpy.float32), data_descriptor, datetime.datetime.now())
+                data_handle = handler.read_data()
+                # the reshape goes to a pending file while the old data is held. the old file closes once the old data is
+                # let go, but the new data is held, so the replacement waits. the properties which describe the new data
+                # follow it, as a data item writes them.
+                handler.write_data(numpy.zeros((6, 4), numpy.float32), data_descriptor, datetime.datetime.now())
+                handler.write_properties({"data_shape": [6, 4], "data_dtype": "float32"}, datetime.datetime.now())
+                new_data_handle = handler.read_data()
+                data_handle = None
+                deferred_files.close_released_files()
+                self.assertEqual(2, len(list(file_path.parent.iterdir())))
+                reading_event = threading.Event()
+                release_event = threading.Event()
+                waiting_data = WaitingData(numpy.ones((6, 4), numpy.float32), reading_event, release_event)
+                thread = threading.Thread(target=handler.write_data, args=(waiting_data, data_descriptor, datetime.datetime.now()))
+                thread.start()
+                try:
+                    self.assertTrue(reading_event.wait(10.0))
+                    # the new data is let go, but the handler is in use, so the replacement waits and the main thread goes
+                    # on without waiting for the write.
+                    new_data_handle = None
+                    deferred_files.close_released_files()
+                    self.assertTrue(thread.is_alive())
+                    self.assertEqual(2, len(list(file_path.parent.iterdir())))
+                finally:
+                    release_event.set()
+                    thread.join()
+                deferred_files.close_released_files()
+                self.assertEqual(["data.h5"], sorted(path.name for path in file_path.parent.iterdir()))
+                self.assertTrue(numpy.array_equal(numpy.ones((6, 4), numpy.float32), numpy.asarray(handler.read_data())))
+            deferred_files.close()
