@@ -44,9 +44,7 @@ if typing.TYPE_CHECKING:
 PersistentDictType = typing.Dict[str, typing.Any]
 _NDArray = numpy.typing.NDArray[typing.Any]
 
-# the log of data file management: data files created, written, moved and deleted. its records are at DEBUG, so it is off
-# by default. turn it on with logging.getLogger("nion.swift.data_files").setLevel(logging.DEBUG), for example from the
-# console or a debugger. its records then go to the app's stderr, not to the Output panel.
+# the log of data file management, which FileStorageSystem describes.
 data_files_logger = logging.getLogger("nion.swift.data_files")
 
 
@@ -305,18 +303,20 @@ def _mark_dataset_removed(dataset: typing.Any) -> uuid.UUID:
 def _mark_file_removed(file_path: pathlib.Path, *, file_locking: bool) -> None:
     file = HDF5FileEntry(file_path, locking=file_locking)
     try:
-        _mark_dataset_removed(file.fp["data"])
+        data_item_uuid = _mark_dataset_removed(file.fp["data"])
         file.fp.flush()
+        data_files_logger.debug("data file marked removed: %s, data item %s, file type HDF5", file_path, data_item_uuid)
     finally:
-        file.close()
+        file.close("marked removed")
 
 
 class HDF5FileEntry:
     """An HDF5 file at a path, opened when first used and owned by one handler.
 
     Each handler opens its own file, so closing it affects only that handler's data. The file may be opened again after
-    it is closed. The count of open files is kept for detecting unclosed files in tests, and the paths of open files so
-    that move_data_file refuses to move or delete a file which this process has open.
+    it is closed. The count of open files, which get_open_count returns, is kept for the data files log and for detecting
+    unclosed files in tests, and the paths of open files so that move_data_file refuses to move or delete a file which
+    this process has open.
     """
     _open_count = 0
     __open_count_lock = threading.Lock()
@@ -344,6 +344,10 @@ class HDF5FileEntry:
             assert self.__fp
             return self.__fp
 
+    @property
+    def path(self) -> pathlib.Path:
+        return self.__path
+
     def open(self) -> None:
         with self.__lock:
             if not self.__fp:
@@ -353,8 +357,10 @@ class HDF5FileEntry:
                 with HDF5FileEntry.__open_count_lock:
                     HDF5FileEntry._open_count += 1
                     HDF5FileEntry.__open_paths[_get_open_path_key(self.__path)] += 1
+                data_files_logger.debug("data file opened: %s, file type HDF5", self.__path)
 
-    def close(self) -> None:
+    def close(self, reason: str | None = None) -> None:
+        """Close the file if it is open. The reason, if given, goes into the data files log with the close."""
         with self.__lock:
             if self.__fp:
                 self.__fp.close()
@@ -364,7 +370,17 @@ class HDF5FileEntry:
                     HDF5FileEntry.__open_paths[open_path_key] -= 1
                     if HDF5FileEntry.__open_paths[open_path_key] == 0:
                         del HDF5FileEntry.__open_paths[open_path_key]
+                if reason is not None:
+                    data_files_logger.debug("data file closed: %s, file type HDF5, reason %s", self.__path, reason)
+                else:
+                    data_files_logger.debug("data file closed: %s, file type HDF5", self.__path)
             self.__fp = None
+
+    @staticmethod
+    def get_open_count() -> int:
+        """Return the number of HDF5 files open in this process."""
+        with HDF5FileEntry.__open_count_lock:
+            return HDF5FileEntry._open_count
 
     @staticmethod
     def is_path_open(path: pathlib.Path) -> bool:
@@ -518,10 +534,23 @@ class HDF5DeferredFiles:
         """Return whether a file last written at last_write_time, by the clock, has had no writes for the sync delay. Any thread."""
         return self.__clock() - last_write_time >= self.__sync_delay
 
+    @property
+    def retired_count(self) -> int:
+        """Return the number of retired files not yet closed."""
+        with self.__lock:
+            return len(self.__retired_files)
+
+    @property
+    def pending_count(self) -> int:
+        """Return the number of pending files not yet replacing their canonical files."""
+        with self.__lock:
+            return len(self.__pending_files)
+
     def retire(self, file: HDF5FileEntry, data_handle: DataHandle.DataHandle) -> None:
         # may be called on any thread.
         with self.__lock:
             self.__retired_files[file] = weakref.finalize(data_handle, self.__released_files.append, file)
+        data_files_logger.debug("data file retired while its data is held: %s, file type HDF5", file.path)
 
     def delete_file(self, file_path: pathlib.Path) -> bool:
         """Delete the file now, or once nothing in this process has it open; return whether it is gone now.
@@ -534,8 +563,8 @@ class HDF5DeferredFiles:
                 return True
             except FileNotFoundError:
                 return True
-            except OSError:
-                pass
+            except OSError as e:
+                data_files_logger.debug("data file delete refused, to be tried again: %s, error %s", file_path, e)
         with self.__lock:
             self.__deleted_files[_get_open_path_key(file_path)] = file_path
         return False
@@ -638,6 +667,7 @@ class HDF5DeferredFiles:
         with self.__lock:
             refused_replace_time = self.__refused_replace_times.setdefault(pending_file_path, now)
             if refused_replace_time is not None and now - refused_replace_time >= self.__stuck_replace_delay:
+                data_files_logger.debug("pending replacement stuck: %s, replaces %s", pending_file_path, canonical_file_path)
                 self.__stuck_replacements.append((pending_file_path, canonical_file_path))
                 self.__refused_replace_times[pending_file_path] = None
 
@@ -718,18 +748,20 @@ class HDF5DeferredFiles:
                 self.__running_sync = None
                 self.__sync_condition.notify_all()
 
-    def close_released_files(self) -> None:
+    def close_released_files(self) -> bool:
         # main thread only. close the files whose last holder has gone, do what waits for the closed files and their
-        # syncs, then complete the pending replacements.
+        # syncs, then complete the pending replacements. return whether anything changed.
+        is_changed = bool(self.__released_files)
         while self.__released_files:
             file = self.__released_files.popleft()
             with self.__lock:
                 self.__retired_files.pop(file, None)
-            file.close()
+            file.close("released by its last holder")
         self.__mark_unmarked_files()
-        self.__delete_files()
-        self.__move_removed_files()
-        self.__complete_pending_files()
+        is_changed = self.__delete_files() or is_changed
+        is_changed = self.__move_removed_files() or is_changed
+        is_changed = self.__complete_pending_files() or is_changed
+        return is_changed
 
     def close(self) -> None:
         # main thread only, after the handlers have closed. what is still refused stays for the next load: a removed
@@ -741,7 +773,7 @@ class HDF5DeferredFiles:
             self.__retired_files = dict()
         for file, finalizer in retired_files.items():
             finalizer.detach()
-            file.close()
+            file.close("project closed")
         self.__released_files.clear()
         self.__mark_unmarked_files()
         self.__delete_files()
@@ -789,25 +821,30 @@ class HDF5DeferredFiles:
                     continue
             self.__unmarked_files.remove(file_path)
 
-    def __delete_files(self) -> None:
+    def __delete_files(self) -> bool:
         # main thread only. delete the files which this process no longer has open. a file whose delete is refused stays
-        # for the next pass.
+        # for the next pass. return whether any file went.
+        is_changed = False
         with self.__lock:
             deleted_files = list(self.__deleted_files.items())
         for open_path_key, file_path in deleted_files:
             if not HDF5FileEntry.is_path_open(file_path):
                 try:
-                    move_data_file(file_path, None)
+                    move_data_file(file_path, None, reason="deferred")
                 except FileNotFoundError:
                     pass
-                except OSError:
+                except OSError as e:
+                    data_files_logger.debug("data file delete refused, to be tried again: %s, error %s", file_path, e)
                     continue
                 with self.__lock:
                     self.__deleted_files.pop(open_path_key, None)
+                is_changed = True
+        return is_changed
 
-    def __move_removed_files(self) -> None:
+    def __move_removed_files(self) -> bool:
         # main thread only. move the removed files which this process no longer has open into the trash. a file whose
-        # move is refused stays in the removed files, to be tried again at the next pass.
+        # move is refused stays in the removed files, to be tried again at the next pass. return whether any file went.
+        is_changed = False
         with self.__lock:
             removed_files = list(self.__removed_files.values())
         for removed_file in removed_files:
@@ -818,7 +855,8 @@ class HDF5DeferredFiles:
                 try:
                     if removed_file.file_path.exists():
                         move_data_file_to_trash(removed_file.file_path, removed_file.trash_file_path, reason=f"data item {removed_file.data_item_uuid} removed")
-                except OSError:
+                except OSError as e:
+                    data_files_logger.debug("removed data file move refused, to be tried again: %s, data item %s, error %s", removed_file.file_path, removed_file.data_item_uuid, e)
                     continue
                 with self.__lock:
                     self.__removed_files.pop(removed_file.data_item_uuid, None)
@@ -826,6 +864,8 @@ class HDF5DeferredFiles:
                 # the canonical file of a removed pending file goes once the pending file is in the trash.
                 if removed_file.canonical_file_path is not None:
                     self.delete_file(removed_file.canonical_file_path)
+                is_changed = True
+        return is_changed
 
     # whether the removed file is synced. otherwise a sync is requested, unless one is waiting or running, and a refused
     # one is tried again. main thread only.
@@ -834,6 +874,8 @@ class HDF5DeferredFiles:
         if sync is not None and sync.is_done and sync.error is None:
             return True
         if sync is None or sync.is_done:
+            if sync is not None:
+                data_files_logger.debug("removed pending file sync refused, to be tried again: %s, error %s", removed_file.file_path, sync.error)
             self.__removed_file_syncs[removed_file.data_item_uuid] = self.request_sync(removed_file.file_path)
         return False
 
@@ -873,7 +915,8 @@ class HDF5DeferredFiles:
                         recorded_file_paths.add(pending_file_path)
                     move_data_file(pending_file_path, get_ready_file_path(canonical_file_path), replace=True, reason="pending replacement refused at close")
                     self.remove_pending_file(pending_file_path)
-                except OSError:
+                except OSError as e:
+                    data_files_logger.debug("pending file not made ready at close: %s, error %s", pending_file_path, e)
                     still_refused_pending_files.append(refused_pending_file)
             refused_pending_files = still_refused_pending_files
             if not refused_pending_files or time.monotonic() >= deadline:
@@ -903,28 +946,34 @@ class HDF5DeferredFiles:
             pending_files = list(self.__pending_files.values())
         return [handler for _, handler_ref, _ in pending_files if (handler := handler_ref() if handler_ref else None) and handler._is_waiting_for_data_handle_unless_busy()]
 
-    def __complete_pending_files(self) -> None:
+    def __complete_pending_files(self) -> bool:
         # main thread only. a handler completes its own replacement unless it is busy on another thread, and is then
         # skipped until the next pass. a replacement left by a closed handler completes once this process has closed both
-        # files.
+        # files. return whether any replacement completed or was discarded.
+        is_changed = False
         with self.__lock:
             pending_files = list(self.__pending_files.items())
         for pending_file_path, (canonical_file_path, handler_ref, _) in pending_files:
             if handler := handler_ref() if handler_ref else None:
-                handler.complete_pending_file_unless_busy()
+                is_changed = handler.complete_pending_file_unless_busy() or is_changed
             elif not pending_file_path.exists():
                 self.remove_pending_file(pending_file_path)
             elif handler_ref is not None:
                 # the handler was dropped without closing, so the pending file may lack the properties which describe
                 # its data, or may not be synced. it is discarded, and the canonical file keeps its previous data.
+                data_files_logger.debug("pending replacement discarded, its handler dropped without closing: %s", pending_file_path)
                 self.discard_pending_file(pending_file_path, canonical_file_path)
+                is_changed = True
             else:
                 try:
-                    move_data_file(pending_file_path, canonical_file_path, replace=True)
-                except OSError:
+                    move_data_file(pending_file_path, canonical_file_path, replace=True, reason="pending replacement completed after its handler closed")
+                except OSError as e:
+                    data_files_logger.debug("pending replacement refused, to be tried again: %s, error %s", pending_file_path, e)
                     self.record_refused_replace(pending_file_path, canonical_file_path)
                     continue
                 self.remove_pending_file(pending_file_path)
+                is_changed = True
+        return is_changed
 
 
 class HDF5IdleFiles:
@@ -951,6 +1000,11 @@ class HDF5IdleFiles:
         # the number of queued files not yet taken in. for testing.
         return len(self.__idle_queue)
 
+    @property
+    def idle_count(self) -> int:
+        """Return the number of files seen idle which are still open. Main thread only."""
+        return sum(1 for file in self.__idle_files if file.is_open)
+
     def queue_idle(self, handler: HDF5Handler, file: HDF5FileEntry) -> None:
         # may be called on any thread, including from a finalizer. a file which is still queued is not queued again, so
         # that each file is queued at most once however often it is used.
@@ -958,9 +1012,11 @@ class HDF5IdleFiles:
             file.is_queued_idle = True
             self.__idle_queue.append((handler, file))
 
-    def close_idle_files(self) -> None:
+    def close_idle_files(self) -> bool:
         # main thread only. take in the queued files, then close the files idle for the delay, oldest first. a file
-        # whose handler is in use on another thread is skipped and kept, as the oldest, for the next pass.
+        # whose handler is in use on another thread is skipped and kept, as the oldest, for the next pass. return
+        # whether any file closed.
+        is_changed = False
         now = self.__clock()
         # take in the queued files without checking them; a file no longer idle is dropped when it comes up to close.
         while self.__idle_queue:
@@ -974,10 +1030,15 @@ class HDF5IdleFiles:
             if now - idle_entry[1] < self.__delay:
                 break
             self.__idle_files.pop(file)
+            # a file which is no longer idle, or was already closed, is dropped without closing it.
+            was_open = file.is_open
             if not idle_entry[0]._close_idle_file_unless_busy(file):
                 busy_files[file] = idle_entry
+            elif was_open and not file.is_open:
+                is_changed = True
         # the busy files go back first, as the oldest.
         self.__idle_files = busy_files | self.__idle_files
+        return is_changed
 
     def close(self) -> None:
         # main thread only. the handlers close their own files.
@@ -1056,7 +1117,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
             # the data item writes no properties while its handler closes, so a described pending file holds all of them,
             # and its sync is waited for.
             is_synced = self.__is_pending_file_synced(wait=True)
-            self.__release_file()
+            self.__release_file("handler closed")
             # a synced pending replacement is left to the deferred files, which complete it once this process has closed
             # both files.
             if self.__is_pending and is_synced:
@@ -1079,7 +1140,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
     # called before the file is moved; give up the current file.
     def prepare_move(self) -> None:
         with self.__lock:
-            self.__release_file()
+            self.__release_file("given up")
 
     @property
     def reference(self) -> str:
@@ -1210,12 +1271,13 @@ class HDF5Handler(StorageHandler.StorageHandler):
             pending_file.fp.flush()
         except Exception:
             # the current file stays as it was; the incomplete pending file goes.
-            pending_file.close()
+            pending_file.close("its write failed")
             self.__deferred_files.delete_file(pending_file_path)
             raise
         superseded_file_path = self.__current_file_path if self.__is_pending else None
-        self.__release_file()
+        self.__release_file("replaced")
         if superseded_file_path is not None:
+            data_files_logger.debug("pending replacement superseded: %s", superseded_file_path)
             self.__deferred_files.discard_pending_file(superseded_file_path, self.__canonical_file_path)
         self.__current_file_path = pending_file_path
         self.__file = pending_file
@@ -1226,6 +1288,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
         self.__is_canonical_file_kept = False
         self.__kept_file_properties = None
         self.__deferred_files.add_pending_file(pending_file_path, self.__canonical_file_path, self, canonical_modified)
+        data_files_logger.debug("pending replacement started: %s, replaces %s, shape %s, dtype %s", pending_file_path, self.__canonical_file_path, data_shape, dataset.dtype)
 
     # complete a pending replacement when a sync covers the writes into the described pending file, the canonical file is
     # not open in this process and the pending file's data handle is not held: the pending file is closed and replaces
@@ -1237,10 +1300,11 @@ class HDF5Handler(StorageHandler.StorageHandler):
             return False
         self.__dataset = None
         self.__data_handle_ref = None
-        self.__file.close()
+        self.__file.close("replacing its canonical file")
         try:
-            move_data_file(self.__current_file_path, self.__canonical_file_path, replace=True)
-        except OSError:
+            move_data_file(self.__current_file_path, self.__canonical_file_path, replace=True, reason="pending replacement completed")
+        except OSError as e:
+            data_files_logger.debug("pending replacement refused, to be tried again: %s, error %s", self.__current_file_path, e)
             self.__deferred_files.record_refused_replace(self.__current_file_path, self.__canonical_file_path)
             return False
         self.__deferred_files.remove_pending_file(self.__current_file_path)
@@ -1290,6 +1354,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
                     return False
                 if sync.error is None:
                     return True
+                data_files_logger.debug("pending file sync refused: %s, error %s", self.__current_file_path, sync.error)
                 if is_requested:
                     return False
             # a file still being written is synced once it has had no writes for the sync delay, so that a file written
@@ -1384,7 +1449,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
             if self._is_file_idle(file):
                 self.__dataset = None
                 self.__data_handle_ref = None
-                file.close()
+                file.close("idle")
             return True
         finally:
             self.__lock.release()
@@ -1392,7 +1457,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
     def remove(self) -> None:
         # a file this process still has open, because its data is held, is deleted once it is closed.
         with self.__lock:
-            self.__release_file()
+            self.__release_file("given up")
             if self.__is_pending:
                 self.__deferred_files.remove_pending_file(self.__current_file_path)
                 self.__deferred_files.delete_file(self.__current_file_path)
@@ -1417,10 +1482,10 @@ class HDF5Handler(StorageHandler.StorageHandler):
                 self.__release_pending_for_removal(trash_file_path)
                 return True
             if self.__get_data_handle() is None:
-                self.__release_file()
+                self.__release_file("given up")
                 return False
             self.__deferred_files.add_removed_file(self.__mark_removed(trash_file_path))
-            self.__release_file()
+            self.__release_file("given up")
             return True
 
     def retire_removed_file(self, trash_file_path: pathlib.Path) -> None:
@@ -1430,7 +1495,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
         """
         with self.__lock:
             removed_file = self.__mark_removed(trash_file_path)
-            self.__release_file()
+            self.__release_file("given up")
             self.__deferred_files.add_removed_file(removed_file)
 
     # mark the current file removed in its properties, leaving the rest of them as they are, and return its removed file.
@@ -1438,6 +1503,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
         self.__ensure_dataset()
         data_item_uuid = _mark_dataset_removed(self.__dataset)
         self.__file.fp.flush()
+        data_files_logger.debug("data file marked removed: %s, data item %s, file type HDF5", self.__current_file_path, data_item_uuid)
         return HDF5RemovedFile(data_item_uuid, pathlib.Path(self.__file_path), trash_file_path)
 
     # give up a pending handler's files for a removal which can be undone; afterwards the handler is no longer pending.
@@ -1458,7 +1524,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
         properties = typing.cast(PersistentDictType, json.loads(self.__dataset.attrs.get("properties", "")))
         pending_file_path = self.__current_file_path
         canonical_modified = self.__deferred_files.get_pending_canonical_modified(pending_file_path)
-        self.__release_file()
+        self.__release_file("given up")
         self.__deferred_files.remove_pending_file(pending_file_path)
         self.__current_file_path = self.__canonical_file_path
         self.__file = HDF5FileEntry(self.__current_file_path, locking=self.__file_locking)
@@ -1467,9 +1533,10 @@ class HDF5Handler(StorageHandler.StorageHandler):
         self.__deferred_files.add_removed_file(HDF5RemovedFile(uuid.UUID(properties["uuid"]), pending_file_path, trash_file_path, self.__canonical_file_path, canonical_modified))
 
     # give up the current file. a file whose data handle is held is retired, so that its holders keep reading its data
-    # but can no longer write it. otherwise the file is closed. either way the handler continues with a new file entry
-    # at the current path, opened when next used, so that the earlier file, if queued as idle, no longer matches.
-    def __release_file(self) -> None:
+    # but can no longer write it. otherwise the file is closed, for the reason, which goes into the data files log.
+    # either way the handler continues with a new file entry at the current path, opened when next used, so that the
+    # earlier file, if queued as idle, no longer matches.
+    def __release_file(self, reason: str) -> None:
         data_handle = self.__get_data_handle()
         self.__dataset = None
         self.__data_handle_ref = None
@@ -1477,7 +1544,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
             data_handle.mark_replaced()
             self.__deferred_files.retire(self.__file, data_handle)
         else:
-            self.__file.close()
+            self.__file.close(reason)
         self.__file = HDF5FileEntry(self.__current_file_path, locking=self.__file_locking)
 
 

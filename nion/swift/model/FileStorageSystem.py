@@ -33,9 +33,10 @@ from nion.swift.model import StorageHandler
 from nion.swift.model import Utility
 from nion.utils import Event
 
-# the log of data file management: data files created, written, moved and deleted. its records are at DEBUG, so it is off
-# by default. turn it on with logging.getLogger("nion.swift.data_files").setLevel(logging.DEBUG), for example from the
-# console or a debugger. its records then go to the app's stderr, not to the Output panel.
+# the log of data file management: data files created, written, moved and deleted, and how they are opened, closed and
+# replaced. its records are at DEBUG, so it is off by default. turn it on with
+# logging.getLogger("nion.swift.data_files").setLevel(logging.DEBUG), for example from the console or a debugger. its
+# records then go to the app's stderr, not to the Output panel.
 data_files_logger = logging.getLogger("nion.swift.data_files")
 
 _ = gettext.gettext
@@ -1108,8 +1109,14 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         self.__hdf5_idle_files.close()
 
     def close_released_files(self) -> None:
-        self.__hdf5_deferred_files.close_released_files()
-        self.__hdf5_idle_files.close_idle_files()
+        is_changed = self.__hdf5_deferred_files.close_released_files()
+        is_changed = self.__hdf5_idle_files.close_idle_files() or is_changed
+        # a pass which changed anything records what is left: the HDF5 files open in this process, and those of this
+        # storage system which are idle, retired and pending.
+        if is_changed and data_files_logger.isEnabledFor(logging.DEBUG):
+            data_files_logger.debug("released files closed: %s, file type HDF5, open files %s, idle files %s, retired files %s, pending files %s", self.__project_data_path,
+                                    HDF5Handler.HDF5FileEntry.get_open_count(), self.__hdf5_idle_files.idle_count, self.__hdf5_deferred_files.retired_count,
+                                    self.__hdf5_deferred_files.pending_count)
 
     def get_data_item_uuids_holding_pending_files(self) -> typing.Sequence[uuid.UUID]:
         handlers = set(self.__hdf5_deferred_files.get_handlers_waiting_for_data_handle())
@@ -1225,9 +1232,10 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         if safe and file_path.exists():
             try:
                 HDF5Handler.move_data_file_to_trash(file_path, trash_file_path, reason="data item removed")
-            except OSError:
+            except OSError as e:
                 # an HDF5 file whose move is refused moves at a later pass, as a held one does.
                 if isinstance(storage_handler, HDF5Handler.HDF5Handler):
+                    data_files_logger.debug("removed data file move refused, to be tried again: %s, error %s", file_path, e)
                     storage_handler.retire_removed_file(trash_file_path)
                     return
                 raise
@@ -1562,9 +1570,10 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         for pending_file_path in pending_file_paths:
             if not HDF5Handler.HDF5FileEntry.is_path_open(pending_file_path):
                 try:
-                    HDF5Handler.move_data_file(pending_file_path, None)
+                    HDF5Handler.move_data_file(pending_file_path, None, reason="pending file discarded at load")
                 except OSError as e:
                     logging.getLogger("loader").warning(f"Unable to delete pending data file {pending_file_path} ({e}).")
+                    data_files_logger.debug("pending file discard at load refused: %s, error %s", pending_file_path, e)
 
     def __complete_ready_files(self, ready_file_paths: typing.Sequence[pathlib.Path]) -> typing.Mapping[str, tuple[pathlib.Path, str | None]]:
         """Replace the canonical file of each ready file which a closed session left, at load, on the main thread.
@@ -1591,14 +1600,16 @@ class FileProjectStorageSystem(ProjectStorageSystem):
                                                         "since the data file has changed since or the new data can't be read.")
                 except OSError as e:
                     logging.getLogger("loader").warning(f"Unable to delete ready data file {ready_file_path} ({e}).")
+                    data_files_logger.debug("ready file discard at load refused: %s, error %s", ready_file_path, e)
                 continue
             try:
                 if canonical_file_path.exists():
-                    HDF5Handler.move_data_file(ready_file_path, canonical_file_path, replace=True)
+                    HDF5Handler.move_data_file(ready_file_path, canonical_file_path, replace=True, reason="ready file completed at load")
                 else:
-                    HDF5Handler.move_data_file(ready_file_path, None)
+                    HDF5Handler.move_data_file(ready_file_path, None, reason="ready file discarded at load, its canonical file gone")
             except OSError as e:
                 logging.getLogger("loader").warning(f"Unable to complete ready data file {ready_file_path} ({e}).")
+                data_files_logger.debug("ready file at load refused: %s, error %s", ready_file_path, e)
                 if canonical_file_path.exists():
                     refused_ready_file_paths[str(canonical_file_path)] = (ready_file_path, recorded_modified)
         return refused_ready_file_paths
