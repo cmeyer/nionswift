@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import threading
 import typing
 
 import numpy
@@ -22,6 +23,9 @@ class DataHandle:
     Indexing returns numpy arrays which are copies, so a slice of a handle owns its data and keeps no link to the file.
     Assignment by index writes into the file. Converting the handle to numpy, or copying it, reads the whole array.
 
+    When the data item's data is replaced while the handle is held, the handle keeps reading the earlier data but
+    refuses writes, raising ValueError, as numpy does for a read-only array.
+
     Numpy operators and array methods other than these (arithmetic, reshape, ravel, T, real, flags) are not available,
     as on an h5py dataset; convert to numpy first.
 
@@ -31,6 +35,9 @@ class DataHandle:
     # the dataset is an h5py dataset, which has no type information.
     def __init__(self, dataset: typing.Any) -> None:
         self.__dataset = dataset
+        # whether the data item's data has been replaced. the write lock orders each write against the mark.
+        self.__replaced = False
+        self.__write_lock = threading.Lock()
 
     def __repr__(self) -> str:
         return f"<DataHandle {self.shape} {self.dtype}>"
@@ -67,7 +74,10 @@ class DataHandle:
 
     # the key and value are anything h5py accepts for assignment by index.
     def __setitem__(self, key: typing.Any, value: typing.Any) -> None:
-        self.__dataset[key] = value
+        with self.__write_lock:
+            if self.__replaced:
+                raise ValueError("The data item's data was replaced, so the write to its earlier data did not happen.")
+            self.__dataset[key] = value
 
     # iterate over the first axis; each item is what indexing returns, a numpy array or a numpy scalar.
     def __iter__(self) -> typing.Iterator[typing.Any]:
@@ -93,6 +103,14 @@ class DataHandle:
     def copy(self) -> _NDArray:
         """Return the whole array as a numpy array."""
         return self.__array__()
+
+    def mark_replaced(self) -> None:
+        """Mark the handle as over data which its storage handler has replaced, so that it refuses writes.
+
+        It waits for a write in progress, a single assignment by index, so the wait is bounded.
+        """
+        with self.__write_lock:
+            self.__replaced = True
 
     # read the selection converted to dtype, for DataHandleAsTypeView. the key is anything h5py accepts as an index; the
     # result is a numpy array or, for a scalar index, a numpy scalar.
