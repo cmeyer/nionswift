@@ -2171,6 +2171,452 @@ class TestStorageClass(unittest.TestCase):
                     self.assertEqual((4, 6, 5), f["data"].shape)
 
     @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_undo_of_removal_refused_by_the_item_file_leaves_the_item_removed_until_a_later_undo(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with contextlib.closing(document_controller):
+                    document_model.data_items[0].set_data(replacement)
+                    # the new data is held, so that it stays at its path and the item's file waits for it.
+                    data_handle = document_model.data_items[0].data
+                    # the undo of the display item's removal restores its display item first and its data item last.
+                    command = document_controller.create_remove_display_items_command(list(document_model.display_items))
+                    command.perform()
+                    document_controller.push_undo_command(command)
+                    file_lock.lock()
+                    document_controller.handle_undo()
+                    self.assertEqual((0, 0), (len(document_model.data_items), len(document_model.display_items)))
+                    file_lock.unlock()
+                    document_controller.handle_undo()
+                    self.assertEqual(document_model.data_items[0], document_model.display_items[0].data_item)
+                    self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+            finally:
+                file_lock.unlock()
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_undo_of_removal_of_two_items_refused_by_one_restores_the_other_and_a_later_undo_restores_both(self):
+        data = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(data))
+                document_model.append_data_item(DataItem.DataItem(data))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with contextlib.closing(document_controller):
+                    # the first item's new data is held, so that it stays at its path and the item's file waits for it.
+                    document_model.data_items[0].set_data(numpy.zeros((2, 2, 2), numpy.float32))
+                    data_handle = document_model.data_items[0].data
+                    command = document_controller.create_remove_data_items_command(list(document_model.data_items))
+                    command.perform()
+                    document_controller.push_undo_command(command)
+                    file_lock.lock()
+                    document_controller.handle_undo()
+                    self.assertEqual(1, len(document_model.data_items))
+                    file_lock.unlock()
+                    document_controller.handle_undo()
+                    self.assertEqual(2, len(document_model.data_items))
+            finally:
+                file_lock.unlock()
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_later_removal_can_be_redone_and_undone_after_a_partly_refused_undo_of_an_earlier_removal_is_tried_again_and_redone(self):
+        data = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                for _ in range(3):
+                    document_model.append_data_item(DataItem.DataItem(data))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with contextlib.closing(document_controller):
+                    first, second, third = document_model.data_items
+                    # the first item's new data is held, so that it stays at its path and the item's file waits for it.
+                    first.set_data(numpy.zeros((2, 2, 2), numpy.float32))
+                    data_handle = first.data
+                    for data_items in ([first, second], [third]):
+                        command = document_controller.create_remove_data_items_command(data_items)
+                        command.perform()
+                        document_controller.push_undo_command(command)
+                    document_controller.handle_undo()
+                    # the undo of the earlier removal restores the second item and is refused by the first item's file.
+                    file_lock.lock()
+                    document_controller.handle_undo()
+                    file_lock.unlock()
+                    document_controller.handle_undo()
+                    document_controller.handle_redo()
+                    document_controller.handle_redo()
+                    self.assertEqual(0, len(document_model.data_items))
+                    document_controller.handle_undo()
+                    self.assertTrue(numpy.array_equal(data, document_model.data_items[0].data))
+                    data_handle = None
+            finally:
+                file_lock.unlock()
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_earlier_removal_can_be_undone_after_a_partly_refused_redo_of_a_later_insert_is_tried_again_and_undone(self):
+        data = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            file_lock: _FileLock | None = None
+            try:
+                with contextlib.closing(document_controller):
+                    document_model.append_data_item(DataItem.DataItem(data))
+                    command = document_controller.create_remove_data_items_command(list(document_model.data_items))
+                    command.perform()
+                    document_controller.push_undo_command(command)
+                    first, second = DataItem.DataItem(data), DataItem.DataItem(data)
+                    command = DocumentController.DocumentController.InsertDataItemsCommand(document_controller, [first, second], 0)
+                    command.perform()
+                    # the first item's new data is held, so that it stays at its path and the item's file waits for it.
+                    file_path = pathlib.Path(first._test_get_file_path())
+                    first.set_data(numpy.zeros((2, 2, 2), numpy.float32))
+                    data_handle = first.data
+                    document_controller.push_undo_command(command)
+                    document_controller.handle_undo()
+                    # the redo of the insert restores the second item and is refused by the first item's file.
+                    file_lock = _FileLock(file_path, refuses_reads=True)
+                    file_lock.lock()
+                    document_controller.handle_redo()
+                    file_lock.unlock()
+                    document_controller.handle_redo()
+                    document_controller.handle_undo()
+                    document_controller.handle_undo()
+                    self.assertEqual(1, len(document_model.data_items))
+                    self.assertTrue(numpy.array_equal(data, document_model.data_items[0].data))
+                    data_handle = None
+            finally:
+                if file_lock:
+                    file_lock.unlock()
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_redo_of_a_later_removal_after_a_partly_refused_undo_of_an_earlier_removal_removes_no_other_item(self):
+        data = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                for title in "abcd":
+                    data_item = DataItem.DataItem(data)
+                    data_item.title = title
+                    document_model.append_data_item(data_item)
+                file_path = pathlib.Path(document_model.data_items[2]._test_get_file_path())
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with contextlib.closing(document_controller):
+                    a, b, c, d = document_model.data_items
+                    # c's new data is held, so that it stays at its path and c's file waits for it.
+                    c.set_data(numpy.zeros((2, 2, 2), numpy.float32))
+                    data_handle = c.data
+                    for data_items in ([c, a], [d]):
+                        command = document_controller.create_remove_data_items_command(data_items)
+                        command.perform()
+                        document_controller.push_undo_command(command)
+                    document_controller.handle_undo()
+                    # the undo of the earlier removal restores a and is refused by c's file.
+                    file_lock.lock()
+                    document_controller.handle_undo()
+                    file_lock.unlock()
+                    document_controller.handle_redo()
+                    self.assertEqual(["a", "b", "d"], sorted(data_item.title for data_item in document_model.data_items))
+                    data_handle = None
+            finally:
+                file_lock.unlock()
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_redo_of_a_removal_made_after_a_partly_refused_undo_removes_no_other_item_once_the_undo_is_tried_again_and_redone(self):
+        data = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                for title in "abc":
+                    data_item = DataItem.DataItem(data)
+                    data_item.title = title
+                    document_model.append_data_item(data_item)
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with contextlib.closing(document_controller):
+                    a, b, c = document_model.data_items
+                    # a's new data is held, so that it stays at its path and a's file waits for it.
+                    a.set_data(numpy.zeros((2, 2, 2), numpy.float32))
+                    data_handle = a.data
+                    for data_items in ([a, b], [c]):
+                        command = document_controller.create_remove_data_items_command(data_items)
+                        command.perform()
+                        document_controller.push_undo_command(command)
+                    document_controller.handle_undo()
+                    # the undo of the earlier removal restores b and is refused by a's file.
+                    file_lock.lock()
+                    document_controller.handle_undo()
+                    file_lock.unlock()
+                    command = document_controller.create_remove_data_items_command([document_model.data_items[0]])
+                    command.perform()
+                    document_controller.push_undo_command(command)
+                    document_controller.handle_undo()
+                    document_controller.handle_undo()
+                    document_controller.handle_redo()
+                    document_controller.handle_redo()
+                    self.assertEqual(["c"], [data_item.title for data_item in document_model.data_items])
+                    data_handle = None
+            finally:
+                file_lock.unlock()
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_undo_of_removal_refused_by_the_item_file_in_the_trash_leaves_the_item_removed_until_a_later_undo(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            file_lock = _FileLock(document_model._project.project_storage_system._trash_dir / file_path.name, refuses_reads=True)
+            try:
+                with contextlib.closing(document_controller):
+                    command = document_controller.create_remove_display_items_command(list(document_model.display_items))
+                    command.perform()
+                    document_controller.push_undo_command(command)
+                    # another program holds the item's file in the trash, which refuses its writes and its move back.
+                    file_lock.lock()
+                    document_controller.handle_undo()
+                    self.assertEqual((0, 0), (len(document_model.data_items), len(document_model.display_items)))
+                    file_lock.unlock()
+                    document_controller.handle_undo()
+                    self.assertEqual(document_model.data_items[0], document_model.display_items[0].data_item)
+                    self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+            finally:
+                file_lock.unlock()
+
+    @unittest.skipIf(sys.platform == "win32", "The test takes the lock with flock, which Windows doesn't have.")
+    def test_undo_of_removal_refused_by_an_hdf5_file_lock_on_the_item_file_in_the_trash_leaves_the_item_removed_until_a_later_undo(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_controller = profile_context.create_document_controller_with_application(auto_close=False)
+            document_model = document_controller.document_model
+            app = typing.cast(Application.Application, document_controller.app)
+            with contextlib.closing(document_controller):
+                command = document_controller.create_remove_display_items_command(list(document_model.display_items))
+                command.perform()
+                document_controller.push_undo_command(command)
+                # another program, such as an h5py script, reads the item's file in the trash with HDF5 file locking, which
+                # takes a shared flock and refuses the exclusive flock which this process takes to open the file for writing.
+                with open(document_model._project.project_storage_system._trash_dir / file_path.name, "rb") as lock_file:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    document_controller.handle_undo()
+                    self.assertEqual((0, 0), (len(document_model.data_items), len(document_model.display_items)))
+                    # the dialog is a second window beside the document window.
+                    self.assertEqual(2, len(app.windows))
+                    app.windows[-1].request_close()
+                document_controller.handle_undo()
+                self.assertEqual(document_model.data_items[0], document_model.display_items[0].data_item)
+                self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+
+    @unittest.skipIf(sys.platform == "win32", "Windows doesn't make a folder read-only with chmod.")
+    def test_undo_of_removal_refused_by_the_trash_folder_leaves_the_hdf5_item_removed_until_a_later_undo(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            trash_dir = document_model._project.project_storage_system._trash_dir
+            try:
+                with contextlib.closing(document_controller):
+                    command = document_controller.create_remove_display_items_command(list(document_model.display_items))
+                    command.perform()
+                    document_controller.push_undo_command(command)
+                    # the trash folder refuses the move of the item's file out of it, while the file takes writes.
+                    trash_dir.chmod(0o555)
+                    document_controller.handle_undo()
+                    self.assertEqual((0, 0), (len(document_model.data_items), len(document_model.display_items)))
+                    trash_dir.chmod(0o755)
+                    document_controller.handle_undo()
+                    self.assertEqual(document_model.data_items[0], document_model.display_items[0].data_item)
+                    self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+            finally:
+                trash_dir.chmod(0o755)
+
+    @unittest.skipIf(sys.platform == "win32", "Windows doesn't make a folder read-only with chmod.")
+    def test_undo_of_removal_refused_by_the_trash_folder_leaves_the_ndata_item_removed_until_a_later_undo(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        with create_temp_profile_context() as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            trash_dir = document_model._project.project_storage_system._trash_dir
+            try:
+                with contextlib.closing(document_controller):
+                    command = document_controller.create_remove_display_items_command(list(document_model.display_items))
+                    command.perform()
+                    document_controller.push_undo_command(command)
+                    # the trash folder refuses the move of the item's file out of it.
+                    trash_dir.chmod(0o555)
+                    document_controller.handle_undo()
+                    self.assertEqual((0, 0), (len(document_model.data_items), len(document_model.display_items)))
+                    trash_dir.chmod(0o755)
+                    document_controller.handle_undo()
+                    self.assertEqual(document_model.data_items[0], document_model.display_items[0].data_item)
+                    self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+            finally:
+                trash_dir.chmod(0o755)
+
+    @unittest.skipUnless(sys.platform == "win32", "Only Windows refuses the move of a file which another program has open.")
+    def test_undo_of_removal_refused_by_a_program_holding_the_item_file_in_the_trash_leaves_the_item_removed_until_a_later_undo(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            with contextlib.closing(document_controller):
+                command = document_controller.create_remove_display_items_command(list(document_model.display_items))
+                command.perform()
+                document_controller.push_undo_command(command)
+                # another program has the item's file in the trash open, sharing its reads and writes but not its delete,
+                # as a cloud sync client may, which refuses its move back.
+                with open(document_model._project.project_storage_system._trash_dir / file_path.name, "rb"):
+                    document_controller.handle_undo()
+                    self.assertEqual((0, 0), (len(document_model.data_items), len(document_model.display_items)))
+                document_controller.handle_undo()
+                self.assertEqual(document_model.data_items[0], document_model.display_items[0].data_item)
+                self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+
+    @unittest.skipUnless(sys.platform == "win32", "Only Windows refuses the rename of a file which another program has open.")
+    def test_undo_of_removal_refused_by_an_hdf5_reader_of_the_item_file_leaves_the_item_removed_until_a_later_undo(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            with contextlib.closing(document_controller):
+                document_model.data_items[0].set_data(replacement)
+                # the new data is held, so that it stays at its path and the item's file waits for it.
+                data_handle = document_model.data_items[0].data
+                command = document_controller.create_remove_display_items_command(list(document_model.display_items))
+                command.perform()
+                document_controller.push_undo_command(command)
+                # another program, such as an h5py script, reads the item's file with HDF5 file locking.
+                with h5py.File(file_path, "r", locking=True):
+                    document_controller.handle_undo()
+                    self.assertEqual((0, 0), (len(document_model.data_items), len(document_model.display_items)))
+                document_controller.handle_undo()
+                self.assertEqual(document_model.data_items[0], document_model.display_items[0].data_item)
+                self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+                data_handle = None
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_redo_of_insert_refused_by_the_item_file_leaves_the_item_removed_until_a_later_redo(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            file_lock: _FileLock | None = None
+            try:
+                with contextlib.closing(document_controller):
+                    def insert_data_item() -> DataItem.DataItem:
+                        data_item = DataItem.DataItem(stored)
+                        document_model.append_data_item(data_item)
+                        return data_item
+
+                    command = DocumentController.DocumentController.InsertDataItemCommand(document_controller, insert_data_item)
+                    command.perform()
+                    document_controller.push_undo_command(command)
+                    data_item = document_model.data_items[0]
+                    file_path = pathlib.Path(data_item._test_get_file_path())
+                    data_item.set_data(replacement)
+                    # the new data is held, so that it stays at its path and the item's file waits for it.
+                    data_handle = data_item.data
+                    document_controller.handle_undo()
+                    file_lock = _FileLock(file_path, refuses_reads=True)
+                    file_lock.lock()
+                    document_controller.handle_redo()
+                    self.assertEqual(0, len(document_model.data_items))
+                    file_lock.unlock()
+                    document_controller.handle_redo()
+                    self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+                    data_handle = None
+            finally:
+                if file_lock:
+                    file_lock.unlock()
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_undo_of_removal_refused_by_the_item_file_shows_a_dialog(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_controller = profile_context.create_document_controller_with_application(auto_close=False)
+            document_model = document_controller.document_model
+            app = typing.cast(Application.Application, document_controller.app)
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with contextlib.closing(document_controller):
+                    document_model.data_items[0].set_data(replacement)
+                    # the new data is held, so that it stays at its path and the item's file waits for it.
+                    data_handle = document_model.data_items[0].data
+                    command = document_controller.create_remove_display_items_command(list(document_model.display_items))
+                    command.perform()
+                    document_controller.push_undo_command(command)
+                    file_lock.lock()
+                    # the dialog is a second window beside the document window.
+                    document_controller.handle_undo()
+                    self.assertEqual(2, len(app.windows))
+                    app.windows[-1].request_close()
+                    data_handle = None
+            finally:
+                file_lock.unlock()
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
     def test_hdf5_data_item_removed_while_its_file_refuses_the_mark_until_the_close_comes_back_with_its_saved_data(self):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)

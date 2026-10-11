@@ -6,6 +6,7 @@ import gettext
 import typing
 
 # local libraries
+from nion.swift.model import Changes
 from nion.swift.model import CommandHistory
 from nion.ui import Window
 
@@ -37,6 +38,10 @@ class UndoableCommand(abc.ABC):
     def __init__(self, title: str, *, command_id: typing.Optional[str] = None, is_mergeable: bool = False) -> None:
         self.__old_modified_state = None
         self.__new_modified_state = None
+        # the state of the document after an undo or redo which a refusal stopped partway. the command compares the
+        # document's state with it in place of a recorded state until the undo or redo completes. it matches neither
+        # recorded state, so a neighboring command recorded on either is disabled.
+        self.__partial_modified_state = None
         self.__title = title
         self.__command_id = command_id
         self.__is_mergeable = is_mergeable
@@ -59,11 +64,11 @@ class UndoableCommand(abc.ABC):
 
     @property
     def is_redo_valid(self) -> bool:
-        return self._compare_modified_states(self.__old_modified_state, self._get_modified_state())
+        return self._compare_modified_states(self.__partial_modified_state if self.__partial_modified_state is not None else self.__old_modified_state, self._get_modified_state())
 
     @property
     def is_undo_valid(self) -> bool:
-        return self._compare_modified_states(self.__new_modified_state, self._get_modified_state())
+        return self._compare_modified_states(self.__partial_modified_state if self.__partial_modified_state is not None else self.__new_modified_state, self._get_modified_state())
 
     def _compare_modified_states(self, state1: typing.Any, state2: typing.Any) -> bool:
         # override to allow the undo command to track state; but only use part of the state for comparison
@@ -96,13 +101,23 @@ class UndoableCommand(abc.ABC):
     def undo(self) -> None:
         # the command log line is "# undo <command id>: <title>", or "# undo: <title>" for a command with no id; redo's is the same with "redo".
         CommandHistory.record(CommandHistory.CommandHistoryEntryKind.UNDO, self.title, identifier=self.command_id or None)
-        self._undo()
+        try:
+            self._undo()
+        except Changes.UndeleteRefusedError:
+            self.__partial_modified_state = self._get_modified_state()
+            raise
+        self.__partial_modified_state = None
         self._set_modified_state(self.__old_modified_state)
         self.__is_mergeable = False
 
     def redo(self) -> None:
         CommandHistory.record(CommandHistory.CommandHistoryEntryKind.REDO, self.title, identifier=self.command_id or None)
-        self._redo()
+        try:
+            self._redo()
+        except Changes.UndeleteRefusedError:
+            self.__partial_modified_state = self._get_modified_state()
+            raise
+        self.__partial_modified_state = None
         self._set_modified_state(self.__new_modified_state)
 
     def can_merge(self, command: UndoableCommand) -> bool:
@@ -198,13 +213,23 @@ class UndoStack:
     def undo(self) -> None:
         assert len(self.__undo_stack) > 0
         undo_command = self.__undo_stack.pop()
-        undo_command.undo()
+        try:
+            undo_command.undo()
+        except Changes.UndeleteRefusedError:
+            # a later undo tries the command again.
+            self.__undo_stack.append(undo_command)
+            raise
         self.__redo_stack.append(undo_command)
 
     def redo(self) -> None:
         assert len(self.__redo_stack) > 0
         undo_command = self.__redo_stack.pop()
-        undo_command.redo()
+        try:
+            undo_command.redo()
+        except Changes.UndeleteRefusedError:
+            # a later redo tries the command again.
+            self.__redo_stack.append(undo_command)
+            raise
         self.__undo_stack.append(undo_command)
 
     def push(self, undo_command: UndoableCommand, *, invoked_from: Window.ActionOrigin | None = None, invoked_from_id: str | None = None) -> None:
