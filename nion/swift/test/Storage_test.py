@@ -17,6 +17,11 @@ import typing
 import unittest
 import uuid
 
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
 # third party libraries
 import h5py
 import numpy
@@ -79,22 +84,46 @@ _CAN_LOCK_FILE = sys.platform == "win32" or (hasattr(os, "chflags") and hasattr(
 
 
 class _FileLock:
-    """A lock on a file which refuses its delete and its replace, with chflags where it exists, and otherwise by holding it open, as Windows refuses them meanwhile."""
+    """A lock on a file which refuses its delete and its replace, with chflags where it exists, and otherwise by holding it open, as Windows refuses them meanwhile.
 
-    def __init__(self, file_path: pathlib.Path) -> None:
+    With refuses_reads, it also refuses HDF5 reads, as another program which has the file open for writing does: with a
+    flock, which is what HDF5 file locking takes, or on Windows with a locked byte. Lock it once this process has closed
+    the file, since HDF5 holds a flock of its own while the file is open.
+    """
+
+    def __init__(self, file_path: pathlib.Path, *, refuses_reads: bool = False) -> None:
         self.__file_path = file_path
+        self.__refuses_reads = refuses_reads
         self.__is_locked = False
         self.__open_file: typing.IO[bytes] | None = None
+        self.__read_lock_file: typing.IO[bytes] | None = None
 
     def lock(self) -> None:
+        # set first, so that unlock releases what a failed lock took.
+        self.__is_locked = True
         if hasattr(os, "chflags"):
             os.chflags(self.__file_path, stat.UF_IMMUTABLE)
         else:
             self.__open_file = open(self.__file_path, "rb")
-        self.__is_locked = True
+        if self.__refuses_reads:
+            read_lock_file = open(self.__file_path, "rb")
+            try:
+                if sys.platform == "win32":
+                    msvcrt.locking(read_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(read_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                read_lock_file.close()
+                raise
+            self.__read_lock_file = read_lock_file
 
     def unlock(self) -> None:
         if self.__is_locked:
+            if self.__read_lock_file:
+                if sys.platform == "win32":
+                    msvcrt.locking(self.__read_lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                self.__read_lock_file.close()
+                self.__read_lock_file = None
             if self.__open_file:
                 self.__open_file.close()
                 self.__open_file = None
@@ -2140,6 +2169,91 @@ class TestStorageClass(unittest.TestCase):
                 self.assertEqual([file_path.name], sorted(path.name for path in trash_dir.iterdir()))
                 with h5py.File(trash_dir / file_path.name, "r") as f:
                     self.assertEqual((4, 6, 5), f["data"].shape)
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_hdf5_data_item_removed_while_its_file_refuses_the_mark_until_the_close_comes_back_with_its_saved_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with document_model.ref():
+                    document_model.data_items[0].set_data(replacement)
+                    file_lock.lock()
+                    document_model.remove_data_item(document_model.data_items[0], safe=True)
+                    self.assertEqual((0, 0), (len(document_model.data_items), len(document_model.display_items)))
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_hdf5_data_item_removed_while_its_file_refuses_the_mark_stays_removed_in_a_copy_made_once_the_mark_is_allowed(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            profile = typing.cast(Profile.Profile, document_model._profile_for_test)
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with document_model.ref():
+                    document_model.data_items[0].set_data(replacement)
+                    # the new data is held, so that it stays at its path and the item's file waits for it.
+                    data_handle = document_model.data_items[0].data
+                    file_lock.lock()
+                    document_model.remove_data_item(document_model.data_items[0], safe=True)
+                    file_lock.unlock()
+                    document_model.close_released_files()
+                    # copy the project while the new data is held, as a crash would leave it.
+                    shutil.copy(profile_context.projects_dir / "Project.nsproj", profile_context.projects_dir / "Crash.nsproj")
+                    shutil.copytree(profile_context.projects_dir / "Project Data", profile_context.projects_dir / "Crash Data")
+                    data_handle = None
+            finally:
+                file_lock.unlock()
+            project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
+            profile.read_project(project_reference)
+            self.assertEqual(0, len(project_reference.document_model.data_items))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_undo_of_removal_while_its_file_refuses_the_mark_restores_the_new_data_at_once_and_replaces_the_file_later(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with document_model.ref():
+                    document_model.data_items[0].set_data(replacement)
+                    file_lock.lock()
+                    undelete_log = document_model.remove_data_item_with_log(document_model.data_items[0], safe=True)
+                    document_model.undelete_all(undelete_log)
+                    undelete_log.close()
+                    self.assertEqual(document_model.data_items[0], document_model.display_items[0].data_item)
+                    self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+                    file_lock.unlock()
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual(1, len(document_model.display_items))
+                self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
 
     def test_hdf5_file_of_data_which_moves_to_ndata_while_held_is_deleted_only_after_the_holder_lets_go(self):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)

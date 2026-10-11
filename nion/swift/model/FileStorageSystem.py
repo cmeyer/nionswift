@@ -1029,7 +1029,7 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         self.__project_data_path = project_data_path
         self.__large_format_size = large_format_size
         # HDF5 files given up while in use, and files waiting to be renamed or deleted, until nothing has them open.
-        self.__hdf5_deferred_files = HDF5Handler.HDF5DeferredFiles()
+        self.__hdf5_deferred_files = HDF5Handler.HDF5DeferredFiles(file_locking=hdf5_file_locking)
         # current HDF5 files whose data nobody holds close here once idle.
         self.__hdf5_idle_files = HDF5Handler.HDF5IdleFiles(delay=idle_file_delay, clock=clock or time.monotonic)
         self.__hdf5_handler_factory = HDF5Handler.HDF5HandlerFactory(self.__hdf5_deferred_files, self.__hdf5_idle_files, file_locking=hdf5_file_locking)
@@ -1185,7 +1185,7 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         # keep the canonical file of a restored pending file, which is marked removed or waits to be deleted. it holds
         # the previous data, consistent with its properties, until the pending file replaces it.
         self.__hdf5_deferred_files.keep_file(file_path)
-        if file_path.exists():
+        if not self.__hdf5_deferred_files.forget_unmarked_file(file_path) and file_path.exists():
             self.__unmark_removed_file(file_path)
 
     def __restore_item_from_storage_handlers(self, storage_handlers: typing.Sequence[StorageHandler.StorageHandler], data_item_uuid: uuid.UUID) -> typing.Optional[PersistentDictType]:
