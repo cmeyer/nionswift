@@ -31,6 +31,7 @@ from nion.swift import Thumbnails
 from nion.swift.model import Cache
 from nion.swift.model import Connection
 from nion.swift.model import DataGroup
+from nion.swift.model import DataHandle
 from nion.swift.model import DataItem
 from nion.swift.model import DocumentModel
 from nion.swift.model import DynamicString
@@ -998,6 +999,61 @@ class TestStorageClass(unittest.TestCase):
                 axes = line_graph_layers_canvas_item._axes_for_testing
                 self.assertEqual((-2.0, 3.0), (axes.uncalibrated_data_min, axes.uncalibrated_data_max))
                 self.assertEqual((0, 11), (axes.drawn_left_channel, axes.drawn_right_channel))
+
+    def test_large_format_data_item_hands_out_one_data_handle_after_reload(self):
+        # a large format size of 0 stores any data in HDF5.
+        stored = numpy.random.default_rng(41).random((6, 5, 7)).astype(numpy.float32)
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                facade_data_item = Facade.DataItem(data_item)
+                data_handle = data_item.xdata.data
+                self.assertIsInstance(data_handle, DataHandle.DataHandle)
+                self.assertIs(data_handle, data_item.xdata.data)
+                self.assertIs(data_handle, data_item.data)
+                self.assertIs(data_handle, data_item.data_and_metadata.data)
+                self.assertIs(data_handle, facade_data_item.data)
+                self.assertIs(data_handle, facade_data_item.xdata.data)
+                self.assertIs(data_handle, facade_data_item.data_and_metadata.data)
+                self.assertTrue(numpy.array_equal(stored, numpy.asarray(data_item.xdata)))
+
+    def test_large_format_data_item_write_through_data_handle_is_read_after_reload(self):
+        # a large format size of 0 stores any data in HDF5.
+        stored = numpy.random.default_rng(41).random((6, 5, 7)).astype(numpy.float32)
+        expected = numpy.copy(stored)
+        expected[1, 2:6] = 3.0
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                data_item.xdata.data[1, 2:6] = 3.0
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                self.assertTrue(numpy.array_equal(expected, data_item.data))
+
+    def test_large_format_data_item_set_to_its_own_data_does_not_rewrite_data(self):
+        # a large format size of 0 stores any data in HDF5.
+        stored = numpy.random.default_rng(41).random((6, 5, 7)).astype(numpy.float32)
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                write_count = data_item._get_persistence_write_count()
+                self.assertIsNotNone(write_count)  # only HDF5 storage counts its data writes
+                data_item.set_xdata(data_item.xdata)
+                self.assertEqual(write_count, data_item._get_persistence_write_count())
+                self.assertTrue(numpy.array_equal(stored, data_item.data))
 
     def test_data_files_log_is_off_by_default_and_records_a_data_file_created_and_deleted_once_on(self):
         logger = logging.getLogger("nion.swift.data_files")
