@@ -1112,6 +1112,58 @@ class TestStorageClass(unittest.TestCase):
                 self.assertTrue(numpy.array_equal(stored, numpy.asarray(data_handle)))
                 self.assertTrue(numpy.array_equal(numpy.zeros((4, 6, 5), numpy.float32), data_item.data))
 
+    def test_loaded_hdf5_data_item_reserved_with_same_shape_takes_partial_updates_without_rewriting_data(self):
+        stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
+        frame = DataAndMetadata.new_data_and_metadata(numpy.full((5, 7), 2.0, numpy.float32))
+        data_metadata = DataAndMetadata.DataMetadata(data_shape_and_dtype=((3, 5, 7), numpy.dtype(numpy.float32)), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
+        expected = numpy.zeros((3, 5, 7), numpy.float32)
+        expected[0:2] = 2.0
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                # the item's data stays loaded, as it does while the item is displayed.
+                with data_item.data_ref():
+                    data_item.reserve_data(data_shape=(3, 5, 7), data_dtype=numpy.dtype(numpy.float32), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
+                    write_count = data_item._get_persistence_write_count()
+                    self.assertIsNotNone(write_count)  # only HDF5 storage counts its data writes
+                    for index in range(2):
+                        data_item.set_data_and_metadata_partial(data_metadata, frame, (slice(None), slice(None)), (slice(index, index + 1), slice(None), slice(None)))
+                    self.assertEqual(write_count, data_item._get_persistence_write_count())
+                    document_model.close_released_files()
+                    self.assertTrue(numpy.array_equal(expected, data_item.data))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(expected, document_model.data_items[0].data))
+
+    def test_loaded_hdf5_data_item_reserved_with_new_shape_takes_partial_updates(self):
+        stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
+        frame = DataAndMetadata.new_data_and_metadata(numpy.full((6, 5), 2.0, numpy.float32))
+        data_metadata = DataAndMetadata.DataMetadata(data_shape_and_dtype=((4, 6, 5), numpy.dtype(numpy.float32)), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
+        expected = numpy.zeros((4, 6, 5), numpy.float32)
+        expected[1:3] = 2.0
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                # the item's data stays loaded, as it does while the item is displayed.
+                with data_item.data_ref():
+                    data_item.reserve_data(data_shape=(4, 6, 5), data_dtype=numpy.dtype(numpy.float32), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
+                    for index in range(1, 3):
+                        data_item.set_data_and_metadata_partial(data_metadata, frame, (slice(None), slice(None)), (slice(index, index + 1), slice(None), slice(None)))
+                    self.assertTrue(numpy.array_equal(expected, data_item.data))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(expected, document_model.data_items[0].data))
+
     @unittest.skipUnless(HDF5Handler._retire_held_files, "Windows closes a held HDF5 file under its holders.")
     def test_replaced_hdf5_file_closes_when_its_holder_drops_it_and_released_files_are_closed(self):
         stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
