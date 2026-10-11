@@ -135,6 +135,12 @@ class HDF5FileEntry:
         self.__lock = threading.RLock()
         self.__path = path
         self.__fp: typing.Optional[_HDF5FilePointer] = None
+        # whether this file is queued as idle, waiting to be taken in by the idle files. it is set when the file is
+        # queued, under its handler's lock or in a finalizer, and cleared on the main thread as the file is taken in. it
+        # needs no lock of its own: reading or writing it is atomic, and it is set before the file is queued and cleared
+        # only after it is taken, so a file which is not queued again while it is set is never lost. two threads
+        # queueing the file at once may both queue it, which is harmless.
+        self.is_queued_idle = False
 
     @property
     def fp(self) -> _HDF5FilePointer:
@@ -158,6 +164,11 @@ class HDF5FileEntry:
                 with HDF5FileEntry.__open_count_lock:
                     HDF5FileEntry._open_count -= 1
             self.__fp = None
+
+    @property
+    def is_open(self) -> bool:
+        with self.__lock:
+            return self.__fp is not None
 
 
 class HDF5RetiredFiles:
@@ -201,10 +212,68 @@ class HDF5RetiredFiles:
         self.__released_files.clear()
 
 
+class HDF5IdleFiles:
+    """Current HDF5 files of handlers whose data handle nobody holds, closed once they stay idle for the delay.
+
+    A handler queues its current file as idle when the last holder of its data handle lets go, and after it uses the
+    file with no data handle held. close_idle_files closes a file which has been idle for the delay, and skips a file
+    whose handler is busy, which stays idle for the next pass. The handler opens the file again when it is next used.
+
+    The delay is in the units of the clock, which returns the current time.
+    """
+
+    def __init__(self, *, delay: float, clock: typing.Callable[[], float]) -> None:
+        self.__delay = delay
+        self.__clock = clock
+        # the files queued as idle, with their handlers. files are queued from any thread; deque appends and pops are
+        # thread safe. the queue is the only path between threads; the rest of the state is confined to the main thread.
+        self.__idle_queue: collections.deque[tuple[HDF5Handler, HDF5FileEntry]] = collections.deque()
+        # the idle files, oldest first, with their handlers and the time each was first seen idle. main thread only.
+        self.__idle_files: dict[HDF5FileEntry, tuple[HDF5Handler, float]] = dict()
+
+    @property
+    def _idle_queue_length(self) -> int:
+        # the number of queued files not yet taken in. for testing.
+        return len(self.__idle_queue)
+
+    def queue_idle(self, handler: HDF5Handler, file: HDF5FileEntry) -> None:
+        # may be called on any thread, including from a finalizer. a file which is still queued is not queued again, so
+        # that each file is queued at most once however often it is used.
+        if not file.is_queued_idle:
+            file.is_queued_idle = True
+            self.__idle_queue.append((handler, file))
+
+    def close_idle_files(self) -> None:
+        # main thread only. take in the queued files, then close the files idle for the delay, oldest first. a file
+        # whose handler is in use on another thread is skipped and kept, as the oldest, for the next pass.
+        now = self.__clock()
+        # take in the queued files without checking them; a file no longer idle is dropped when it comes up to close.
+        while self.__idle_queue:
+            handler, file = self.__idle_queue.popleft()
+            file.is_queued_idle = False
+            self.__idle_files.pop(file, None)
+            self.__idle_files[file] = (handler, now)
+        busy_files = dict[HDF5FileEntry, tuple[HDF5Handler, float]]()
+        while oldest_entry := next(iter(self.__idle_files.items()), None):
+            file, idle_entry = oldest_entry
+            if now - idle_entry[1] < self.__delay:
+                break
+            self.__idle_files.pop(file)
+            if not idle_entry[0]._close_idle_file_unless_busy(file):
+                busy_files[file] = idle_entry
+        # the busy files go back first, as the oldest.
+        self.__idle_files = busy_files | self.__idle_files
+
+    def close(self) -> None:
+        # main thread only. the handlers close their own files.
+        self.__idle_queue.clear()
+        self.__idle_files.clear()
+
+
 class HDF5Handler(StorageHandler.StorageHandler):
     count = 0  # useful for detecting leaks in tests
 
-    def __init__(self, file_path: str | pathlib.Path, retired_files: HDF5RetiredFiles | None = None) -> None:
+    def __init__(self, file_path: str | pathlib.Path, retired_files: HDF5RetiredFiles | None = None, idle_files: HDF5IdleFiles | None = None) -> None:
         self.__file_path = str(file_path)
         self.__lock = threading.RLock()
         self.__file = HDF5FileEntry(pathlib.Path(self.__file_path))
@@ -215,6 +284,9 @@ class HDF5Handler(StorageHandler.StorageHandler):
         # which closes them after their last holder. a handler made without them closes its retired files when it closes.
         self.__storage_retired_files = retired_files
         self.__retired_files = retired_files if retired_files is not None else HDF5RetiredFiles()
+        # the idle files of its storage system, which close the current file once nobody has used it for a while. a
+        # handler made without them keeps its current file open until it closes or gives it up.
+        self.__idle_files = idle_files
         self._write_count = 0
         HDF5Handler.count += 1
 
@@ -227,7 +299,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
 
     @property
     def factory(self) -> StorageHandler.StorageHandlerFactoryLike:
-        return HDF5HandlerFactory(self.__storage_retired_files)
+        return HDF5HandlerFactory(self.__storage_retired_files, self.__idle_files)
 
     @property
     def storage_handler_type(self) -> str:
@@ -313,6 +385,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
             if json_properties is not None:
                 self.__dataset.attrs["properties"] = json_properties
             self.__file.fp.flush()
+            self.__queue_if_idle()
 
     def reserve_data(self, data_shape: DataAndMetadata.ShapeType, data_dtype: numpy.typing.DTypeLike, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:
         # reserve data of the given shape and dtype, filled with zeros
@@ -337,33 +410,67 @@ class HDF5Handler(StorageHandler.StorageHandler):
                 dtype = numpy.dtype(data_dtype)
                 data_files_logger.debug("data file created: %s, file type HDF5, shape %s, dtype %s", self.__file_path, data_shape, dtype)
                 data_files_logger.debug("data reserved: %s, file type HDF5, shape %s, dtype %s", self.__file_path, data_shape, dtype)
+            self.__queue_if_idle()
 
     def write_properties(self, properties: PersistentDictType, file_datetime: datetime.datetime) -> None:
         with self.__lock:
             self.__ensure_dataset()
             self.__write_properties_to_dataset(properties)
             self.__file.fp.flush()
+            self.__queue_if_idle()
 
     def read_properties(self) -> PersistentDictType:
         with self.__lock:
             self.__ensure_dataset()
             json_properties = self.__dataset.attrs.get("properties", "")
+            self.__queue_if_idle()
             return typing.cast(PersistentDictType, json.loads(json_properties))
 
     def read_data(self) -> DataHandle.DataHandle | None:
         with self.__lock:
             self.__ensure_dataset()
             if self.__dataset.shape == (0, ):
+                self.__queue_if_idle()
                 return None
             data_handle = self.__get_data_handle()
             if data_handle is None:
                 data_handle = DataHandle.DataHandle(self.__dataset)
                 self.__data_handle_ref = weakref.ref(data_handle)
+                # when the last holder lets go, the file becomes idle. the finalizer queues this file entry, so it does
+                # nothing once the file is given up.
+                if self.__idle_files is not None:
+                    weakref.finalize(data_handle, self.__idle_files.queue_idle, self, self.__file)
             return data_handle
 
     # the data handle handed out for the current dataset, if it is still held.
     def __get_data_handle(self) -> DataHandle.DataHandle | None:
         return self.__data_handle_ref() if self.__data_handle_ref else None
+
+    # queue the current file as idle when no data handle is held, so that it closes once nobody has used it for a while.
+    # called under the lock after using the file.
+    def __queue_if_idle(self) -> None:
+        if self.__idle_files is not None and self.__get_data_handle() is None:
+            self.__idle_files.queue_idle(self, self.__file)
+
+    # whether the file is still the current file, open, and its data handle not held. any thread.
+    def _is_file_idle(self, file: HDF5FileEntry) -> bool:
+        with self.__lock:
+            return file is self.__file and file.is_open and self.__get_data_handle() is None
+
+    # close the file if it is still idle, unless another thread holds the lock; return whether the lock was free. a data
+    # handle is only made under the lock, so a reader on another thread either holds a handle before this, and the file
+    # stays open, or opens the file again after it. main thread only; it never waits for this lock.
+    def _close_idle_file_unless_busy(self, file: HDF5FileEntry) -> bool:
+        if not self.__lock.acquire(blocking=False):
+            return False
+        try:
+            if self._is_file_idle(file):
+                self.__dataset = None
+                self.__data_handle_ref = None
+                file.close()
+            return True
+        finally:
+            self.__lock.release()
 
     def remove(self) -> None:
         with self.__lock:
@@ -372,24 +479,26 @@ class HDF5Handler(StorageHandler.StorageHandler):
                 os.remove(self.__file_path)
                 data_files_logger.debug("data file deleted: %s, file type HDF5", self.__file_path)
 
-    # give up the current file. a file whose data handle is held is retired, so that its holders keep reading its data,
-    # and the handler opens a new file at its path when next used. otherwise the file is closed.
+    # give up the current file. a file whose data handle is held is retired, so that its holders keep reading its data.
+    # otherwise the file is closed. either way the handler continues with a new file entry at its path, opened when next
+    # used, so that the earlier file, if queued as idle, no longer matches.
     def __release_file(self) -> None:
         data_handle = self.__get_data_handle()
         self.__dataset = None
         self.__data_handle_ref = None
         if data_handle is not None and _retire_held_files:
             self.__retired_files.retire(self.__file, data_handle)
-            self.__file = HDF5FileEntry(pathlib.Path(self.__file_path))
         else:
             self.__file.close()
+        self.__file = HDF5FileEntry(pathlib.Path(self.__file_path))
 
 
 class HDF5HandlerFactory(StorageHandler.StorageHandlerFactoryLike):
 
-    def __init__(self, retired_files: HDF5RetiredFiles | None = None) -> None:
-        # the retired files of the storage system which makes handlers with this factory, if any.
+    def __init__(self, retired_files: HDF5RetiredFiles | None = None, idle_files: HDF5IdleFiles | None = None) -> None:
+        # the retired and idle files of the storage system which makes handlers with this factory, if any.
         self.__retired_files = retired_files
+        self.__idle_files = idle_files
 
     def get_storage_handler_type(self) -> str:
         return "hdf5"
@@ -400,7 +509,7 @@ class HDF5HandlerFactory(StorageHandler.StorageHandlerFactoryLike):
         return False
 
     def make(self, file_path: pathlib.Path) -> StorageHandler.StorageHandler:
-        return HDF5Handler(self.make_path(file_path), self.__retired_files)
+        return HDF5Handler(self.make_path(file_path), self.__retired_files, self.__idle_files)
 
     def make_path(self, file_path: pathlib.Path) -> str:
         return str(file_path.with_suffix(self.get_extension()))

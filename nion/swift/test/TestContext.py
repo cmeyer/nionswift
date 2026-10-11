@@ -5,6 +5,7 @@ import json
 import logging
 import pathlib
 import shutil
+import time
 import types
 import typing
 import unittest
@@ -239,11 +240,13 @@ class FileProfileContext:
 
     Tests use it where memory storage would hide a defect, e.g. memory storage returns the stored array itself, so an in-place
     write to it looks persisted. The workspace directory is __Test in base_directory, and it is removed on close unless no_remove
-    is set. Projects read through this context store data above large_format_size bytes in HDF5 and smaller data in ndata.
+    is set. Projects read through this context store data above large_format_size bytes in HDF5 and smaller data in ndata, and
+    close a data file once it has been idle for idle_file_delay by the clock.
     """
 
-    def __init__(self, base_directory: pathlib.Path, no_remove: bool = False, *, large_format_size: int = FileStorageSystem.DEFAULT_LARGE_FORMAT_SIZE) -> None:
-        self.project_storage_settings = FileStorageSystem.ProjectStorageSettings(large_format_size=large_format_size)
+    def __init__(self, base_directory: pathlib.Path, no_remove: bool = False, *, large_format_size: int = FileStorageSystem.DEFAULT_LARGE_FORMAT_SIZE,
+                 idle_file_delay: float = FileStorageSystem.DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None) -> None:
+        self.project_storage_settings = FileStorageSystem.ProjectStorageSettings(large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock or time.monotonic)
         self.workspace_dir = base_directory / "__Test"
         self.profiles_dir = base_directory / "__Test" / "Profiles"
         self.projects_dir = base_directory / "__Test" / "Projects"

@@ -4,11 +4,13 @@ import os
 import pathlib
 import shutil
 import tempfile
+import threading
 import unittest
 import uuid
 
 # third party libraries
 import numpy
+import numpy.typing
 
 # local libraries
 from nion.data import DataAndMetadata
@@ -157,3 +159,73 @@ class TestHDF5Handler(unittest.TestCase):
                 other_handler.write_data(data_handle, data_descriptor, datetime.datetime.now())
                 self.assertEqual(other_write_count + 1, other_handler._write_count)
                 self.assertTrue(numpy.array_equal(stored, numpy.asarray(other_handler.read_data())))
+
+    def test_closing_idle_files_skips_a_file_in_use_on_another_thread_and_closes_it_once_free(self):
+        # data which another thread writes, and which waits for an event when the write reads it, so that the write holds
+        # the handler busy for as long as the test needs, as a long write does.
+        class WaitingData:
+            def __init__(self, data: numpy.ndarray, reading_event: threading.Event, release_event: threading.Event) -> None:
+                self.data = data
+                self.shape = data.shape
+                self.dtype = data.dtype
+                self.reading_event = reading_event
+                self.release_event = release_event
+
+            def __array__(self, dtype: numpy.typing.DTypeLike = None, copy: bool | None = None) -> numpy.ndarray:
+                self.reading_event.set()
+                # the timeout only keeps a failing test from hanging.
+                self.release_event.wait(10.0)
+                return self.data.astype(dtype) if dtype is not None else self.data
+
+        data_descriptor = DataAndMetadata.DataDescriptor(False, 0, 2)
+        clock_time = [100.0]
+        idle_files = HDF5Handler.HDF5IdleFiles(delay=5.0, clock=lambda: clock_time[0])
+        with tempfile.TemporaryDirectory() as directory:
+            handler = HDF5Handler.HDF5Handler(pathlib.Path(directory) / "data.h5", idle_files=idle_files)
+            with contextlib.closing(handler):
+                open_count = HDF5Handler.HDF5FileEntry._open_count
+                handler.write_data(numpy.zeros((5, 7), numpy.float32), data_descriptor, datetime.datetime.now())
+                # the pass takes the file in as idle, so that it has been idle for the delay at the pass below.
+                idle_files.close_idle_files()
+                reading_event = threading.Event()
+                release_event = threading.Event()
+                waiting_data = WaitingData(numpy.ones((5, 7), numpy.float32), reading_event, release_event)
+                thread = threading.Thread(target=handler.write_data, args=(waiting_data, data_descriptor, datetime.datetime.now()))
+                thread.start()
+                try:
+                    self.assertTrue(reading_event.wait(10.0))
+                    # the file has been idle for the delay, but its handler is in use, so the file stays open and the
+                    # main thread goes on without waiting for the write.
+                    clock_time[0] += 5.0
+                    idle_files.close_idle_files()
+                    self.assertTrue(thread.is_alive())
+                    self.assertEqual(open_count + 1, HDF5Handler.HDF5FileEntry._open_count)
+                finally:
+                    release_event.set()
+                    thread.join()
+                # the write used the file, so once the write is done the file closes when it has been idle for the delay
+                # since then.
+                idle_files.close_idle_files()
+                self.assertEqual(open_count + 1, HDF5Handler.HDF5FileEntry._open_count)
+                clock_time[0] += 5.0
+                idle_files.close_idle_files()
+                self.assertEqual(open_count, HDF5Handler.HDF5FileEntry._open_count)
+                self.assertTrue(numpy.array_equal(numpy.ones((5, 7), numpy.float32), numpy.asarray(handler.read_data())))
+
+    def test_using_an_unheld_file_many_times_queues_it_idle_once(self):
+        properties = {"title": "title", "uuid": str(uuid.uuid4())}
+        idle_files = HDF5Handler.HDF5IdleFiles(delay=5.0, clock=lambda: 100.0)
+        with tempfile.TemporaryDirectory() as directory:
+            handler = HDF5Handler.HDF5Handler(pathlib.Path(directory) / "data.h5", idle_files=idle_files)
+            with contextlib.closing(handler):
+                handler.write_data(numpy.zeros((5, 7), numpy.float32), DataAndMetadata.DataDescriptor(False, 0, 2), datetime.datetime.now())
+                handler.write_properties(properties, datetime.datetime.now())
+                for _ in range(100):
+                    self.assertEqual(properties, handler.read_properties())
+                # each use queues the file as idle, since no data handle is held; it stays queued until taken in.
+                self.assertEqual(1, idle_files._idle_queue_length)
+                # once the file is taken in, the next use queues it again.
+                idle_files.close_idle_files()
+                self.assertEqual(0, idle_files._idle_queue_length)
+                handler.read_properties()
+                self.assertEqual(1, idle_files._idle_queue_length)

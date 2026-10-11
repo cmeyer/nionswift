@@ -16,6 +16,7 @@ import os.path
 import pathlib
 import shutil
 import threading
+import time
 import typing
 import uuid
 
@@ -52,16 +53,25 @@ _CreateStorageHandlerFn = typing.Type[StorageHandler.StorageHandler]
 # data above this many bytes is stored in HDF5, and otherwise in ndata.
 DEFAULT_LARGE_FORMAT_SIZE = 16 * 1024 * 1024
 
+# a data file whose data nobody holds closes once it has been idle for this many seconds.
+DEFAULT_IDLE_FILE_DELAY = 5.0
+
 
 @dataclasses.dataclass(frozen=True)
 class ProjectStorageSettings:
-    """How a project's file storage chooses where to store data.
+    """How a project's file storage chooses where to store data, and when it closes idle data files.
 
     The settings apply to index projects only, not to legacy folder projects or to the project an upgrade writes.
     """
 
     large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE
     """The number of bytes above which data is stored in HDF5, and otherwise in ndata."""
+
+    idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY
+    """The time, by the clock, after which a data file whose data nobody holds closes."""
+
+    clock: typing.Callable[[], float] = time.monotonic
+    """The clock which times idle files, returning the current time in seconds."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -650,7 +660,7 @@ class ProjectStorageSystem(PersistentStorageSystem):
         self.__storage_adapter_map.clear()
 
     def close_released_files(self) -> None:
-        """Close the files kept open for holders of data items' data whose last holder has gone. Main thread only."""
+        """Close the data files whose last holder has gone, and those which nobody has used for a while. Main thread only."""
         pass
 
     @abc.abstractmethod
@@ -987,21 +997,32 @@ class FileProjectStorageSystem(ProjectStorageSystem):
 
     _file_handler_factories: typing.List[StorageHandler.StorageHandlerFactoryLike] = [NDataHandler.NDataHandlerFactory(), HDF5Handler.HDF5HandlerFactory()]
 
-    def __init__(self, project_path: pathlib.Path, project_data_path: pathlib.Path | None = None, *, large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE) -> None:
+    def __init__(self, project_path: pathlib.Path, project_data_path: pathlib.Path | None = None, *,
+                 large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE, idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None) -> None:
+        """Make the storage system of the project at project_path.
+
+        Data above large_format_size bytes is stored in HDF5. A data file whose data nobody holds closes once it has
+        been idle for idle_file_delay seconds. The clock returns the current time in seconds, and defaults to
+        time.monotonic.
+        """
         super().__init__()
         self.__project_path = project_path
         self.__project_data_path = project_data_path
         self.__large_format_size = large_format_size
         # HDF5 files replaced while their data is held stay open here until their last holder goes or this closes.
         self.__hdf5_retired_files = HDF5Handler.HDF5RetiredFiles()
-        self._file_handler_factories = [NDataHandler.NDataHandlerFactory(), HDF5Handler.HDF5HandlerFactory(self.__hdf5_retired_files)]
+        # current HDF5 files whose data nobody holds close here once idle.
+        self.__hdf5_idle_files = HDF5Handler.HDF5IdleFiles(delay=idle_file_delay, clock=clock or time.monotonic)
+        self._file_handler_factories = [NDataHandler.NDataHandlerFactory(), HDF5Handler.HDF5HandlerFactory(self.__hdf5_retired_files, self.__hdf5_idle_files)]
 
     def close(self) -> None:
         super().close()
         self.__hdf5_retired_files.close()
+        self.__hdf5_idle_files.close()
 
     def close_released_files(self) -> None:
         self.__hdf5_retired_files.close_released_files()
+        self.__hdf5_idle_files.close_idle_files()
 
     def normalize_project_data_path(self) -> None:
         # in order to be resilient to name changes, first make a list of folders in project_data_folders which
@@ -1569,8 +1590,9 @@ def make_memory_persistent_storage_system() -> Persistence.PersistentStorageInte
     return MemoryPersistentStorageSystem()
 
 
-def make_index_project_storage_system(project_path: pathlib.Path, *, large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE) -> ProjectStorageSystem:
-    return FileProjectStorageSystem(project_path, large_format_size=large_format_size)
+def make_index_project_storage_system(project_path: pathlib.Path, *, large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE,
+                                      idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None) -> ProjectStorageSystem:
+    return FileProjectStorageSystem(project_path, large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock)
 
 
 def make_folder_project_storage_system(project_folder_path: pathlib.Path) -> typing.Optional[ProjectStorageSystem]:
