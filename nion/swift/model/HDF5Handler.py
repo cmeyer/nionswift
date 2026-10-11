@@ -131,9 +131,11 @@ class HDF5FileEntry:
     _open_count = 0
     __open_count_lock = threading.Lock()
 
-    def __init__(self, path: pathlib.Path) -> None:
+    def __init__(self, path: pathlib.Path, *, locking: bool = True) -> None:
         self.__lock = threading.RLock()
         self.__path = path
+        # whether HDF5 locks the file while it is open.
+        self.__locking = locking
         self.__fp: typing.Optional[_HDF5FilePointer] = None
         # whether this file is queued as idle, waiting to be taken in by the idle files. it is set when the file is
         # queued, under its handler's lock or in a finalizer, and cleared on the main thread as the file is taken in. it
@@ -153,7 +155,8 @@ class HDF5FileEntry:
         with self.__lock:
             if not self.__fp:
                 self.__path.parent.mkdir(parents=True, exist_ok=True)
-                self.__fp = h5py.File(self.__path, "a")
+                # None keeps HDF5's own locking.
+                self.__fp = h5py.File(self.__path, "a", locking=None if self.__locking else False)
                 with HDF5FileEntry.__open_count_lock:
                     HDF5FileEntry._open_count += 1
 
@@ -273,10 +276,13 @@ class HDF5IdleFiles:
 class HDF5Handler(StorageHandler.StorageHandler):
     count = 0  # useful for detecting leaks in tests
 
-    def __init__(self, file_path: str | pathlib.Path, retired_files: HDF5RetiredFiles | None = None, idle_files: HDF5IdleFiles | None = None) -> None:
+    def __init__(self, file_path: str | pathlib.Path, retired_files: HDF5RetiredFiles | None = None, idle_files: HDF5IdleFiles | None = None, *,
+                 file_locking: bool = True) -> None:
         self.__file_path = str(file_path)
         self.__lock = threading.RLock()
-        self.__file = HDF5FileEntry(pathlib.Path(self.__file_path))
+        # whether HDF5 locks the files this handler opens.
+        self.__file_locking = file_locking
+        self.__file = HDF5FileEntry(pathlib.Path(self.__file_path), locking=file_locking)
         self.__dataset: typing.Any = None
         # the data handle handed out for the current dataset, while anyone holds it.
         self.__data_handle_ref: weakref.ReferenceType[DataHandle.DataHandle] | None = None
@@ -299,7 +305,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
 
     @property
     def factory(self) -> StorageHandler.StorageHandlerFactoryLike:
-        return HDF5HandlerFactory(self.__storage_retired_files, self.__idle_files)
+        return HDF5HandlerFactory(self.__storage_retired_files, self.__idle_files, file_locking=self.__file_locking)
 
     @property
     def storage_handler_type(self) -> str:
@@ -491,15 +497,17 @@ class HDF5Handler(StorageHandler.StorageHandler):
             self.__retired_files.retire(self.__file, data_handle)
         else:
             self.__file.close()
-        self.__file = HDF5FileEntry(pathlib.Path(self.__file_path))
+        self.__file = HDF5FileEntry(pathlib.Path(self.__file_path), locking=self.__file_locking)
 
 
 class HDF5HandlerFactory(StorageHandler.StorageHandlerFactoryLike):
 
-    def __init__(self, retired_files: HDF5RetiredFiles | None = None, idle_files: HDF5IdleFiles | None = None) -> None:
-        # the retired and idle files of the storage system which makes handlers with this factory, if any.
+    def __init__(self, retired_files: HDF5RetiredFiles | None = None, idle_files: HDF5IdleFiles | None = None, *, file_locking: bool = True) -> None:
+        # the retired and idle files of the storage system which makes handlers with this factory, if any, and whether HDF5
+        # locks the files its handlers open.
         self.__retired_files = retired_files
         self.__idle_files = idle_files
+        self.__file_locking = file_locking
 
     def get_storage_handler_type(self) -> str:
         return "hdf5"
@@ -510,7 +518,7 @@ class HDF5HandlerFactory(StorageHandler.StorageHandlerFactoryLike):
         return False
 
     def make(self, file_path: pathlib.Path) -> StorageHandler.StorageHandler:
-        return HDF5Handler(self.make_path(file_path), self.__retired_files, self.__idle_files)
+        return HDF5Handler(self.make_path(file_path), self.__retired_files, self.__idle_files, file_locking=self.__file_locking)
 
     def make_path(self, file_path: pathlib.Path) -> str:
         return str(file_path.with_suffix(self.get_extension()))

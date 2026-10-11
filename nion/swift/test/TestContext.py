@@ -241,12 +241,15 @@ class FileProfileContext:
     Tests use it where memory storage would hide a defect, e.g. memory storage returns the stored array itself, so an in-place
     write to it looks persisted. The workspace directory is __Test in base_directory, and it is removed on close unless no_remove
     is set. Projects read through this context store data above large_format_size bytes in HDF5 and smaller data in ndata, and
-    close a data file once it has been idle for idle_file_delay by the clock.
+    close a data file once it has been idle for idle_file_delay by the clock. Without hdf5_file_locking, HDF5 doesn't lock the
+    files it has open, so that a test can copy a project folder while its files are open, as Windows otherwise refuses.
     """
 
     def __init__(self, base_directory: pathlib.Path, no_remove: bool = False, *, large_format_size: int = FileStorageSystem.DEFAULT_LARGE_FORMAT_SIZE,
-                 idle_file_delay: float = FileStorageSystem.DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None) -> None:
-        self.project_storage_settings = FileStorageSystem.ProjectStorageSettings(large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock or time.monotonic)
+                 idle_file_delay: float = FileStorageSystem.DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None,
+                 hdf5_file_locking: bool = True) -> None:
+        self.project_storage_settings = FileStorageSystem.ProjectStorageSettings(large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock or time.monotonic,
+                                                                                 hdf5_file_locking=hdf5_file_locking)
         self.workspace_dir = base_directory / "__Test"
         self.profiles_dir = base_directory / "__Test" / "Profiles"
         self.projects_dir = base_directory / "__Test" / "Projects"

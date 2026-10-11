@@ -59,7 +59,7 @@ DEFAULT_IDLE_FILE_DELAY = 5.0
 
 @dataclasses.dataclass(frozen=True)
 class ProjectStorageSettings:
-    """How a project's file storage chooses where to store data, and when it closes idle data files.
+    """How a project's file storage chooses where to store data, when it closes idle data files, and whether HDF5 locks the files it has open.
 
     The settings apply to index projects only, not to legacy folder projects or to the project an upgrade writes.
     """
@@ -72,6 +72,9 @@ class ProjectStorageSettings:
 
     clock: typing.Callable[[], float] = time.monotonic
     """The clock which times idle files, returning the current time in seconds."""
+
+    hdf5_file_locking: bool = True
+    """Whether HDF5 locks the data files it has open, as it does by default."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -998,12 +1001,13 @@ class FileProjectStorageSystem(ProjectStorageSystem):
     _file_handler_factories: typing.List[StorageHandler.StorageHandlerFactoryLike] = [NDataHandler.NDataHandlerFactory(), HDF5Handler.HDF5HandlerFactory()]
 
     def __init__(self, project_path: pathlib.Path, project_data_path: pathlib.Path | None = None, *,
-                 large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE, idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None) -> None:
+                 large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE, idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None,
+                 hdf5_file_locking: bool = True) -> None:
         """Make the storage system of the project at project_path.
 
         Data above large_format_size bytes is stored in HDF5. A data file whose data nobody holds closes once it has
         been idle for idle_file_delay seconds. The clock returns the current time in seconds, and defaults to
-        time.monotonic.
+        time.monotonic. HDF5 locks the files it has open unless hdf5_file_locking is False.
         """
         super().__init__()
         self.__project_path = project_path
@@ -1013,7 +1017,7 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         self.__hdf5_retired_files = HDF5Handler.HDF5RetiredFiles()
         # current HDF5 files whose data nobody holds close here once idle.
         self.__hdf5_idle_files = HDF5Handler.HDF5IdleFiles(delay=idle_file_delay, clock=clock or time.monotonic)
-        self._file_handler_factories = [NDataHandler.NDataHandlerFactory(), HDF5Handler.HDF5HandlerFactory(self.__hdf5_retired_files, self.__hdf5_idle_files)]
+        self._file_handler_factories = [NDataHandler.NDataHandlerFactory(), HDF5Handler.HDF5HandlerFactory(self.__hdf5_retired_files, self.__hdf5_idle_files, file_locking=hdf5_file_locking)]
 
     def close(self) -> None:
         super().close()
@@ -1591,8 +1595,9 @@ def make_memory_persistent_storage_system() -> Persistence.PersistentStorageInte
 
 
 def make_index_project_storage_system(project_path: pathlib.Path, *, large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE,
-                                      idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None) -> ProjectStorageSystem:
-    return FileProjectStorageSystem(project_path, large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock)
+                                      idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None,
+                                      hdf5_file_locking: bool = True) -> ProjectStorageSystem:
+    return FileProjectStorageSystem(project_path, large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock, hdf5_file_locking=hdf5_file_locking)
 
 
 def make_folder_project_storage_system(project_folder_path: pathlib.Path) -> typing.Optional[ProjectStorageSystem]:
