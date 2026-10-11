@@ -479,14 +479,15 @@ class HDF5Handler(StorageHandler.StorageHandler):
                 os.remove(self.__file_path)
                 data_files_logger.debug("data file deleted: %s, file type HDF5", self.__file_path)
 
-    # give up the current file. a file whose data handle is held is retired, so that its holders keep reading its data.
-    # otherwise the file is closed. either way the handler continues with a new file entry at its path, opened when next
-    # used, so that the earlier file, if queued as idle, no longer matches.
+    # give up the current file. a file whose data handle is held is retired, so that its holders keep reading its data
+    # but can no longer write it. otherwise the file is closed. either way the handler continues with a new file entry
+    # at its path, opened when next used, so that the earlier file, if queued as idle, no longer matches.
     def __release_file(self) -> None:
         data_handle = self.__get_data_handle()
         self.__dataset = None
         self.__data_handle_ref = None
         if data_handle is not None and _retire_held_files:
+            data_handle.mark_replaced()
             self.__retired_files.retire(self.__file, data_handle)
         else:
             self.__file.close()

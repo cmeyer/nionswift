@@ -1165,6 +1165,26 @@ class TestStorageClass(unittest.TestCase):
                 self.assertTrue(numpy.array_equal(expected, document_model.data_items[0].data))
 
     @unittest.skipUnless(HDF5Handler._retire_held_files, "Windows closes a held HDF5 file under its holders.")
+    def test_holder_of_hdf5_data_cannot_write_after_data_is_reserved(self):
+        stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                data_handle = data_item.data
+                data_item.reserve_data(data_shape=(3, 5, 7), data_dtype=numpy.dtype(numpy.float32), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
+                with self.assertRaises(ValueError):
+                    data_handle[1] = numpy.full((5, 7), 2.0, numpy.float32)
+                self.assertTrue(numpy.array_equal(numpy.zeros((3, 5, 7), numpy.float32), data_item.data))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(numpy.zeros((3, 5, 7), numpy.float32), document_model.data_items[0].data))
+
+    @unittest.skipUnless(HDF5Handler._retire_held_files, "Windows closes a held HDF5 file under its holders.")
     def test_replaced_hdf5_file_closes_when_its_holder_drops_it_and_released_files_are_closed(self):
         stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.
