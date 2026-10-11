@@ -1210,9 +1210,8 @@ class ImageCanvasItem(DisplayCanvasItem.DisplayCanvasItem):
                                 color_map_rgba = color_map_rgba.view(numpy.uint32).reshape(color_map_rgba.shape[:-1])
                             else:
                                 color_map_rgba = None
-                            # the canvas item expects a ndarray. since the data is being accessed directly here, it could
-                            # be an array compatible that might be deleted (e.g. a hdf5 dataset). so convert it to a numpy
-                            # if not already.
+                            # the canvas item expects a ndarray. the data may be array compatible without being one, such
+                            # as the data handle of data stored in hdf5, so convert it to a numpy array if it is not one.
                             display_data_data = display_data.data
                             if not isinstance(display_data_data, numpy.ndarray):
                                 display_data_data = numpy.array(display_data_data)

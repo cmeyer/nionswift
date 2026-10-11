@@ -20,6 +20,7 @@ import typing
 
 # local libraries
 from nion.data import DataAndMetadata
+from nion.swift.model import DataHandle
 from nion.swift.model import StorageHandler
 from nion.swift.model import Utility
 from nion.utils import Geometry
@@ -421,16 +422,17 @@ class NDataHandler(StorageHandler.StorageHandler):
     def get_extension(self) -> str:
         return ".ndata"
 
-    def write_data(self, data: _NDArray, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:
+    def write_data(self, data: _NDArray | DataHandle.DataHandle, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:
         """
             Write data to the ndata file specified by reference.
 
-            :param data: the numpy array data to write
+            :param data: the numpy array data, or a data handle whose data is read, to write
             :param file_datetime: the datetime for the file
         """
         with self.__lock:
             assert data is not None
-            self.__write_data(data, file_datetime)
+            # the data is read once, whether it is an array or a data handle.
+            self.__write_data(numpy.asarray(data), file_datetime)
             data_files_logger.debug("data written: %s, file type ndata, shape %s, dtype %s", self.__file_path, data.shape, data.dtype)
 
     def reserve_data(self, data_shape: typing.Tuple[int, ...], data_dtype: numpy.typing.DTypeLike, data_descriptor: DataAndMetadata.DataDescriptor, file_datetime: datetime.datetime) -> None:

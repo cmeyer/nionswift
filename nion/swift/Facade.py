@@ -1006,7 +1006,9 @@ class DataItem(metaclass=SharedInstance):
 
     @property
     def data(self) -> NDArray:
-        """Return the data as a numpy ndarray.
+        """Return the data as a numpy ndarray, or as a data handle for data stored in HDF5.
+
+        A data handle has the interface of an h5py dataset. Use numpy.asarray to read it as a numpy ndarray.
 
         .. versionadded:: 1.0
 
