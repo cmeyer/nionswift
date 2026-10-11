@@ -66,8 +66,10 @@ def memory_usage_resource():
 
 
 def create_temp_profile_context(no_remove: bool = False, *, large_format_size: int = FileStorageSystem.DEFAULT_LARGE_FORMAT_SIZE,
-                                idle_file_delay: float = FileStorageSystem.DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None) -> TestContext.FileProfileContext:
-    return TestContext.FileProfileContext(pathlib.Path.cwd(), no_remove=no_remove, large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock)
+                                idle_file_delay: float = FileStorageSystem.DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None,
+                                hdf5_file_locking: bool = True) -> TestContext.FileProfileContext:
+    return TestContext.FileProfileContext(pathlib.Path.cwd(), no_remove=no_remove, large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock,
+                                          hdf5_file_locking=hdf5_file_locking)
 
 
 def create_memory_profile_context() -> TestContext.MemoryProfileContext:
