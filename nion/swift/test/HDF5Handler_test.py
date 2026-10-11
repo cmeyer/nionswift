@@ -3,6 +3,8 @@ import datetime
 import os
 import pathlib
 import shutil
+import stat
+import sys
 import tempfile
 import threading
 import unittest
@@ -229,3 +231,21 @@ class TestHDF5Handler(unittest.TestCase):
                 self.assertEqual(0, idle_files._idle_queue_length)
                 handler.read_properties()
                 self.assertEqual(1, idle_files._idle_queue_length)
+
+    @unittest.skipUnless(sys.platform == "win32" or hasattr(os, "chflags"), "Linux has no lock which refuses the move of a file.")
+    def test_move_of_data_file_refused_by_a_lock_on_it_leaves_no_copy_at_the_new_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = pathlib.Path(directory) / "data.h5"
+            file_path.write_bytes(bytes(8))
+            new_file_path = pathlib.Path(directory) / "moved.h5"
+            # Windows refuses the move while another program has the file open, and macOS while the file is immutable.
+            with open(file_path, "rb"):
+                if hasattr(os, "chflags"):
+                    os.chflags(file_path, stat.UF_IMMUTABLE)
+                try:
+                    with self.assertRaises(OSError):
+                        HDF5Handler.move_data_file(file_path, new_file_path)
+                finally:
+                    if hasattr(os, "chflags"):
+                        os.chflags(file_path, 0)
+            self.assertFalse(new_file_path.exists())

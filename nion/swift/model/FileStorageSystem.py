@@ -663,7 +663,7 @@ class ProjectStorageSystem(PersistentStorageSystem):
         self.__storage_adapter_map.clear()
 
     def close_released_files(self) -> None:
-        """Close the data files whose last holder has gone, and those which nobody has used for a while. Main thread only."""
+        """Close the data files which nobody holds or has used for a while, and do the moves waiting for them. Main thread only."""
         pass
 
     @abc.abstractmethod
@@ -692,6 +692,13 @@ class ProjectStorageSystem(PersistentStorageSystem):
 
     @abc.abstractmethod
     def _delete_duplicate_storage_handler(self, storage_handler: StorageHandler.StorageHandler, data_item_uuid: uuid.UUID) -> None: ...
+
+    @abc.abstractmethod
+    def _discard_removed_storage_handler(self, storage_handler: StorageHandler.StorageHandler) -> None: ...
+
+    def _take_restored_storage_handler(self, data_item_uuid: uuid.UUID) -> StorageHandler.StorageHandler | None:
+        # the storage handler for a data item restored where its file is, if it was; otherwise None.
+        return None
 
     # for migration
 
@@ -768,6 +775,12 @@ class ProjectStorageSystem(PersistentStorageSystem):
                 storage_handler_properties = storage_handler.read_properties()
                 storage_handler.prepare_move()
                 assert storage_handler_properties is not None
+                # a file marked removed belongs to a removed data item. it is skipped, as earlier versions skip it, and
+                # discarded.
+                if storage_handler_properties.get("version") == HDF5Handler.REMOVED_FILE_VERSION:
+                    storage_handler.close()
+                    self._discard_removed_storage_handler(storage_handler)
+                    continue
                 combined_properties = Migration.transform_to_latest(storage_handler_properties)
                 assert combined_properties.get("uuid")
                 data_item_uuid = uuid.UUID(combined_properties["uuid"])
@@ -780,8 +793,8 @@ class ProjectStorageSystem(PersistentStorageSystem):
                 reader_error_list.append(Persistence.ReaderError(storage_handler.reference, e, traceback.extract_stack()))
 
         # a data item with more than one file of the version this reads takes its properties and its data from one of
-        # them; the others are closed and deleted. a file of another version is never chosen over one of this version,
-        # and never deleted.
+        # them; the others are closed and deleted. a file written by another version is never chosen over one of this
+        # version, and never deleted. a file marked removed is not one of these: it is deleted by the code above.
         reader_infos_by_uuid: dict[uuid.UUID, list[ReaderInfo]] = dict()
         for reader_info in reader_info_list:
             if reader_info.properties.get("version", 0) == DataItem.DataItem.writer_version:
@@ -867,7 +880,9 @@ class ProjectStorageSystem(PersistentStorageSystem):
     def _insert_item(self, parent: Persistence.PersistentObject, name: str, before_index: int, item: Persistence.PersistentObject) -> None:
         if isinstance(item, DataItem.DataItem):
             item_uuid = item.uuid
-            storage_handler = self._make_storage_handler(make_storage_handler_attributes(item))
+            storage_handler = self._take_restored_storage_handler(item_uuid)
+            if storage_handler is None:
+                storage_handler = self._make_storage_handler(make_storage_handler_attributes(item))
             assert item_uuid not in self.__storage_adapter_map
             persistent_dict = self._get_persistent_dict(item)
             assert persistent_dict is not None
@@ -1017,7 +1032,10 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         self.__hdf5_retired_files = HDF5Handler.HDF5RetiredFiles()
         # current HDF5 files whose data nobody holds close here once idle.
         self.__hdf5_idle_files = HDF5Handler.HDF5IdleFiles(delay=idle_file_delay, clock=clock or time.monotonic)
-        self._file_handler_factories = [NDataHandler.NDataHandlerFactory(), HDF5Handler.HDF5HandlerFactory(self.__hdf5_retired_files, self.__hdf5_idle_files, file_locking=hdf5_file_locking)]
+        self.__hdf5_handler_factory = HDF5Handler.HDF5HandlerFactory(self.__hdf5_retired_files, self.__hdf5_idle_files, file_locking=hdf5_file_locking)
+        self._file_handler_factories = [NDataHandler.NDataHandlerFactory(), self.__hdf5_handler_factory]
+        # the files of data items restored where they are, by data item uuid, until the data items are inserted.
+        self.__restored_file_paths: dict[uuid.UUID, pathlib.Path] = dict()
 
     def close(self) -> None:
         super().close()
@@ -1109,15 +1127,21 @@ class FileProjectStorageSystem(ProjectStorageSystem):
     def _remove_storage_handler(self, storage_handler: StorageHandler.StorageHandler, *, safe: bool = False) -> None:
         assert self.__project_data_path is not None
         file_path = pathlib.Path(storage_handler.reference)
-        file_name = file_path.parts[-1]
-        trash_dir = self.__project_data_path / "trash"
-        new_file_path = trash_dir / file_name
+        trash_file_path = self.__project_data_path / "trash" / file_path.name
+        # a removal which can be undone moves the file into the trash. an HDF5 file whose data is held stays open at its
+        # path for its holders instead, marked removed, and moves into the trash after the last holder lets go.
+        if safe and isinstance(storage_handler, HDF5Handler.HDF5Handler) and storage_handler.release_for_removal(trash_file_path):
+            return
         storage_handler.prepare_move()  # moving files in the storage handler requires it to be closed.
-        # TODO: move this functionality to the storage handler.
-        if safe and not os.path.exists(new_file_path):
-            trash_dir.mkdir(exist_ok=True)
-            shutil.move(str(file_path), new_file_path)
-            data_files_logger.debug("data file moved: %s, to %s, reason data item removed", file_path, new_file_path)
+        if safe and file_path.exists():
+            try:
+                HDF5Handler.move_data_file_to_trash(file_path, trash_file_path, reason="data item removed")
+            except OSError:
+                # an HDF5 file whose move is refused moves at a later pass, as a held one does.
+                if isinstance(storage_handler, HDF5Handler.HDF5Handler):
+                    storage_handler.retire_removed_file(trash_file_path)
+                    return
+                raise
         storage_handler.remove()
 
     def _replace_storage_handler(self, storage_handler: StorageHandler.StorageHandler, storage_handler_attributes: StorageHandler.StorageHandlerAttributes) -> StorageHandler.StorageHandler:
@@ -1127,6 +1151,15 @@ class FileProjectStorageSystem(ProjectStorageSystem):
 
     def _restore_item(self, data_item_uuid: uuid.UUID) -> typing.Optional[PersistentDictType]:
         assert self.__project_data_path is not None
+        # a removed file which has not yet moved into the trash is restored where it is: its marker is removed, and it
+        # becomes the data item's file again when the data item is inserted, while its earlier holders keep reading it.
+        if (file_path := self.__hdf5_retired_files.restore_removed_file(data_item_uuid)) is not None:
+            with contextlib.closing(self.__hdf5_handler_factory.make(file_path)) as storage_handler:
+                storage_handler_properties = storage_handler.read_properties()
+                storage_handler_properties["version"] = DataItem.DataItem.writer_version
+                storage_handler.write_properties(storage_handler_properties, datetime.datetime.now())
+            self.__restored_file_paths[data_item_uuid] = file_path
+            return Migration.transform_to_latest(storage_handler_properties)
         trash_dir = self.__project_data_path / "trash"
         # a data file in the trash is normally named for its data item, so only that file is read. files named
         # otherwise are found by reading every file in the trash.
@@ -1144,6 +1177,11 @@ class FileProjectStorageSystem(ProjectStorageSystem):
             for storage_handler in storage_handlers:
                 storage_handler_properties = storage_handler.read_properties()
                 assert storage_handler_properties is not None
+                # a file which moved into the trash after its holders let go is marked removed. remove the marker before
+                # the data item reads the file.
+                if storage_handler_properties.get("uuid", None) == data_item_uuid_str and storage_handler_properties.get("version") == HDF5Handler.REMOVED_FILE_VERSION:
+                    storage_handler_properties["version"] = DataItem.DataItem.writer_version
+                    storage_handler.write_properties(storage_handler_properties, datetime.datetime.now())
                 properties = Migration.transform_to_latest(storage_handler_properties)
                 if properties.get("uuid", None) == data_item_uuid_str:
                     data_item = DataItem.DataItem(item_uuid=data_item_uuid)
@@ -1156,6 +1194,7 @@ class FileProjectStorageSystem(ProjectStorageSystem):
                         if not os.path.exists(new_file_path):
                             os.makedirs(os.path.dirname(new_file_path), exist_ok=True)
                             storage_handler.prepare_move()  # moving files in the storage handler requires it to be closed.
+                            # a refused rename still copies the file, so that the data item is at its path at the next load.
                             shutil.move(old_file_path, new_file_path)
                             data_files_logger.debug("data file moved: %s, data item %s, to %s, reason data item restored", old_file_path, data_item_uuid, new_file_path)
                         self._make_storage_handler(make_storage_handler_attributes(data_item)).close()  # what's this line for?
@@ -1184,11 +1223,25 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         # it again.
         file_path = pathlib.Path(storage_handler.reference)
         try:
-            file_path.unlink(missing_ok=True)
-            data_files_logger.debug("data file deleted: %s, reason another file of data item %s chosen, at load", file_path, data_item_uuid)
+            HDF5Handler.move_data_file(file_path, None, reason=f"another file of data item {data_item_uuid} chosen, at load")
+        except FileNotFoundError:
+            # a file which vanished since the scan is already gone, as the delete intends.
+            data_files_logger.debug("data file already gone: %s, reason another file of data item %s chosen, at load", file_path, data_item_uuid)
         except OSError as e:
             logging.getLogger("loader").warning(f"Unable to delete data file {file_path} ({e}).")
             data_files_logger.debug("duplicate data file delete at load refused: %s, data item %s, error %s", file_path, data_item_uuid, e)
+
+    def _discard_removed_storage_handler(self, storage_handler: StorageHandler.StorageHandler) -> None:
+        # delete the closed file. a file which cannot be deleted stays in place, and the next load skips it again.
+        try:
+            HDF5Handler.move_data_file(pathlib.Path(storage_handler.reference), None, reason="marked removed, at load")
+        except OSError as e:
+            logging.getLogger("loader").warning(f"Unable to delete removed data file {storage_handler.reference} ({e}).")
+
+    def _take_restored_storage_handler(self, data_item_uuid: uuid.UUID) -> StorageHandler.StorageHandler | None:
+        if (file_path := self.__restored_file_paths.pop(data_item_uuid, None)) is not None:
+            return self.__hdf5_handler_factory.make(file_path)
+        return None
 
     @property
     def _trash_dir(self) -> pathlib.Path:
@@ -1542,6 +1595,10 @@ class MemoryProjectStorageSystem(ProjectStorageSystem):
 
     def _delete_duplicate_storage_handler(self, storage_handler: StorageHandler.StorageHandler, data_item_uuid: uuid.UUID) -> None:
         # memory storage keeps the duplicate entry; each load chooses the same entry over it.
+        pass
+
+    def _discard_removed_storage_handler(self, storage_handler: StorageHandler.StorageHandler) -> None:
+        # memory storage never marks an entry removed.
         pass
 
     def _migrate_data_item(self, reader_info: ReaderInfo, index: int, count: int) -> typing.Optional[ReaderInfo]:
