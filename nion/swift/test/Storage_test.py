@@ -1419,6 +1419,61 @@ class TestStorageClass(unittest.TestCase):
                 self.assertEqual(open_count, HDF5Handler.HDF5FileEntry._open_count)
                 self.assertTrue(numpy.array_equal(replacement, data_item.data))
 
+    @unittest.skipUnless(HDF5Handler._retire_held_files, "Windows closes a held HDF5 file under its holders.")
+    def test_hdf5_data_item_set_from_another_items_hdf5_data_lets_that_file_close_when_its_data_is_replaced(self):
+        stored = numpy.random.default_rng(46).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(47).random((5, 4, 6)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5; a delay of 0 closes idle files at the next close.
+        with create_temp_profile_context(large_format_size=0, idle_file_delay=0.0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                document_model.append_data_item(DataItem.DataItem(numpy.zeros((2, 3, 4), numpy.float32)))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                open_count = HDF5Handler.HDF5FileEntry._open_count
+                source_data_item, target_data_item = document_model.data_items
+                # the target stays held, as it does while displayed. it holds no file until it is read again.
+                with target_data_item.data_ref():
+                    target_data_item.set_xdata(source_data_item.xdata)
+                    source_data_item.set_data(replacement)
+                    document_model.close_released_files()
+                    self.assertEqual(open_count, HDF5Handler.HDF5FileEntry._open_count)
+                    self.assertTrue(numpy.array_equal(stored, target_data_item.data))
+                    self.assertTrue(numpy.array_equal(replacement, source_data_item.data))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                source_data_item, target_data_item = document_model.data_items
+                self.assertTrue(numpy.array_equal(replacement, source_data_item.data))
+                self.assertTrue(numpy.array_equal(stored, target_data_item.data))
+
+    @unittest.skipUnless(HDF5Handler._retire_held_files, "Windows closes a held HDF5 file under its holders.")
+    def test_ndata_data_item_set_from_a_view_of_another_items_hdf5_data_lets_that_file_close_when_its_data_is_replaced(self):
+        stored = numpy.random.default_rng(46).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(47).random((5, 4, 6)).astype(numpy.float32)
+        # a large format size of 256 stores the float32 source in HDF5 and its float16 view, of 210 bytes, in ndata; a
+        # delay of 0 closes idle files at the next close.
+        with create_temp_profile_context(large_format_size=256, idle_file_delay=0.0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                document_model.append_data_item(DataItem.DataItem(numpy.zeros((2, 3, 4), numpy.float16)))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                open_count = HDF5Handler.HDF5FileEntry._open_count
+                source_data_item, target_data_item = document_model.data_items
+                # the target stays loaded, as it does while displayed.
+                with target_data_item.data_ref():
+                    target_data_item.set_xdata(DataAndMetadata.new_data_and_metadata(source_data_item.data.astype(numpy.float16)))
+                    self.assertTrue(target_data_item._test_get_file_path().endswith(".ndata"))
+                    source_data_item.set_data(replacement)
+                    document_model.close_released_files()
+                    self.assertEqual(open_count, HDF5Handler.HDF5FileEntry._open_count)
+                    self.assertTrue(numpy.array_equal(stored.astype(numpy.float16), target_data_item.data))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(stored.astype(numpy.float16), document_model.data_items[1].data))
+
     def test_data_files_log_is_off_by_default_and_records_a_data_file_created_and_deleted_once_on(self):
         logger = logging.getLogger("nion.swift.data_files")
         # a large format size of 256 stores (2, 3) float32 data in ndata and (3, 5, 7) float32 data in HDF5.

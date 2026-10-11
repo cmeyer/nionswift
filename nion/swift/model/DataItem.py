@@ -524,6 +524,17 @@ class DataItem(Persistence.PersistentObject):
     def __write_data(self) -> None:
         if self.__data is not None:
             self.write_external_data("data", self.__data)
+            self.__drop_given_data_once_stored()
+
+    # once the item's storage holds the given data, drop given data which is not a numpy array, such as another item's
+    # data handle or a view of one, which would keep another item's file open. the next read of the item loads its own
+    # stored data in its place. a numpy array keeps no file open, and the item keeps it rather than read its storage
+    # again. the drop is under the mutex, so that a reader on another thread takes either the given data or, after the
+    # drop, loads the item's own.
+    def __drop_given_data_once_stored(self) -> None:
+        with self.__data_ref_count_mutex:
+            if self.__data is not None and not isinstance(self.__data, numpy.ndarray) and self.persistent_object_context and not self.is_write_delayed:
+                self.__data = None
 
     def _finish_pending_write(self) -> None:
         if self.__pending_write:
@@ -1315,6 +1326,7 @@ class DataItem(Persistence.PersistentObject):
             if self.__data is not None:
                 if self.persistent_object_context and not self.is_write_delayed:
                     self.write_external_data("data", self.__data)
+                    self.__drop_given_data_once_stored()
                     self.__data_and_metadata_unloadable = True
         finally:
             self.decrement_data_ref_count()
