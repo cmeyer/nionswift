@@ -3929,6 +3929,32 @@ class TestStorageClass(unittest.TestCase):
                 self.assertTrue(numpy.array_equal(replacement, source_data_item.data))
                 self.assertTrue(numpy.array_equal(stored, target_data_item.data))
 
+    def test_partial_update_in_a_transaction_to_data_item_set_from_another_items_hdf5_data_does_not_change_the_other_item(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        frame = DataAndMetadata.new_data_and_metadata(numpy.full((5, 7), 9.0, numpy.float32))
+        data_metadata = DataAndMetadata.DataMetadata(data_shape_and_dtype=((3, 5, 7), numpy.dtype(numpy.float32)), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                document_model.append_data_item(DataItem.DataItem(numpy.zeros((3, 5, 7), numpy.float32)))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                source_data_item, target_data_item = document_model.data_items
+                with document_model.item_transaction(target_data_item):
+                    target_data_item.set_xdata(source_data_item.xdata)
+                    target_data_item.set_data_and_metadata_partial(data_metadata, frame, (slice(None), slice(None)), (slice(1, 2), slice(None), slice(None)))
+                expected = numpy.copy(stored)
+                expected[1] = 9.0
+                self.assertTrue(numpy.array_equal(stored, numpy.asarray(source_data_item.data)))
+                self.assertTrue(numpy.array_equal(expected, numpy.asarray(target_data_item.data)))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                source_data_item, target_data_item = document_model.data_items
+                self.assertTrue(numpy.array_equal(stored, numpy.asarray(source_data_item.data)))
+                self.assertTrue(numpy.array_equal(expected, numpy.asarray(target_data_item.data)))
+
     def test_ndata_data_item_set_from_a_view_of_another_items_hdf5_data_lets_that_file_close_when_its_data_is_replaced(self):
         stored = numpy.random.default_rng(46).random((3, 5, 7)).astype(numpy.float32)
         replacement = numpy.random.default_rng(47).random((5, 4, 6)).astype(numpy.float32)
