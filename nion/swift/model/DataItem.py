@@ -217,6 +217,11 @@ class DataItem(Persistence.PersistentObject):
         self.define_property("session", dict(), changed=self.__property_changed, hidden=True)
         self.define_property("category", "persistent", changed=self.__property_changed, hidden=True, value_type=str)
         self.__data: typing.Optional[_ImageDataType] = None
+
+        # whether the data was given to the item, rather than loaded from its storage. given data which is not a numpy
+        # array may be another item's, and a partial update to this item must not change it.
+        self.__is_data_given = False
+
         self.__data_metadata: typing.Optional[DataAndMetadata.DataMetadata] = None
         self.__data_and_metadata_unloadable = False
         self.__data_and_metadata_first_update_after_reserve = False
@@ -1228,6 +1233,7 @@ class DataItem(Persistence.PersistentObject):
         if self.persistent_object_context and self.__data is None and self.__data_metadata:
             # a data handle is typed as the array which data and metadata expects.
             self.__data = typing.cast(typing.Optional[_ImageDataType], self.read_external_data("data"))
+            self.__is_data_given = False
 
     def __unload_data(self) -> None:
         if self.__data_and_metadata_unloadable:
@@ -1285,6 +1291,7 @@ class DataItem(Persistence.PersistentObject):
         data_metadata = copy.deepcopy(data_and_metadata.data_metadata) if data_and_metadata else None
         with self.__data_ref_count_mutex:
             self.__data = data_and_metadata.data if data_and_metadata else None
+            self.__is_data_given = True
             if data_metadata:
                 self.__data_metadata = data_metadata
         self.__change_changed = True
@@ -1396,6 +1403,12 @@ class DataItem(Persistence.PersistentObject):
                     assert self.data_shape == data_metadata.data_shape
                     assert self.data_dtype == data_metadata.data_dtype
                     assert self.data_dtype == data_and_metadata.data_dtype, f"{self.data_dtype=} == {data_and_metadata.data_dtype=}"
+                    # given data which is not a numpy array, such as another item's data handle, which the item keeps while
+                    # its writes are delayed, is copied into memory before a partial update writes into it, so that the
+                    # update changes only this item. the copy is under the mutex, since it changes which data a reader takes.
+                    if self.__is_data_given and not isinstance(self.__data, numpy.ndarray):
+                        with self.__data_ref_count_mutex:
+                            self.__data = numpy.array(self.__data)
                     self.__data[tuple(dst)] = data_and_metadata._data_ex[tuple(src)]
                     # mark changes and update session
                     self.__change_changed = True
