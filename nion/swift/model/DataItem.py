@@ -1239,6 +1239,24 @@ class DataItem(Persistence.PersistentObject):
         if self.__data_and_metadata_unloadable:
             self.__data = None
 
+    def drop_loaded_data(self, replace_file: typing.Callable[[], bool]) -> bool:
+        """Drop the data the item loaded from its storage, while the data is referenced, and replace the item's file.
+
+        replace_file replaces the item's file with its pending file, and returns whether it did. The next read of the data
+        loads it again. The item keeps data given to it, and its data while its writes are delayed, and then doesn't call
+        replace_file. Returns whether the item dropped its data and its file was replaced. Main thread only.
+        """
+        # the storage doesn't take the item's lock or call into the item, so the item calls the storage, through a
+        # parameter, since there is one caller. replace_file runs under the lock, so that a reader which hasn't taken
+        # the data yet loads it from the replaced file. given data holds no file once it is stored (see
+        # __drop_given_data_once_stored). while writes are delayed, the pending file lacks the properties which describe
+        # the writes, so it must not replace the item's file yet.
+        with self.__data_ref_count_mutex:
+            if self.__data is not None and not self.__is_data_given and self.persistent_object_context and not self.is_write_delayed:
+                self.__data = None
+                return replace_file()
+        return False
+
     @property
     def is_unloadable(self) -> bool:
         return self.__data_and_metadata_unloadable

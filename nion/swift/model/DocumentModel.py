@@ -1901,7 +1901,15 @@ class DocumentModel(Observable.Observable, ReferenceCounting.ReferenceCounted, D
     def close_released_files(self) -> None:
         """Close the data files which nobody holds or has used for a while, and do the moves, deletes and replacements waiting for them."""
         assert threading.current_thread() == threading.main_thread()
-        self._project.project_storage_system.close_released_files()
+        project = self._project
+        project_storage_system = project.project_storage_system
+        # a data item whose pending file waits only for the data item's loaded data drops the data, so that the pending
+        # file replaces its file while the data item is displayed.
+        for data_item_uuid in project_storage_system.get_data_item_uuids_holding_pending_files():
+            data_item = project.get_item_by_uuid("data_items", data_item_uuid)
+            if isinstance(data_item, DataItem.DataItem):
+                data_item.drop_loaded_data(functools.partial(project_storage_system.complete_pending_file, data_item_uuid))
+        project_storage_system.close_released_files()
 
     # for testing
     def _get_pending_data_item_updates_count(self) -> int:
