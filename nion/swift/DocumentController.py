@@ -324,6 +324,11 @@ class DocumentController(Window.Window):
 
         self.document_model.perform_all_call_soon()  # perform any pending items in the queue
 
+        # stuck data files reported while the dialog is open wait, by path, for the next dialog.
+        self.__is_stuck_data_files_dialog_open = False
+        self.__held_stuck_data_file_lines = dict[pathlib.Path, str]()
+        self.__data_file_replacements_stuck_listener: Event.EventListener | None = self.document_model.data_file_replacements_stuck_event.listen(self.__handle_data_file_replacements_stuck)
+
         self.filter_controller = FilterPanel.FilterController(self)
 
         self.focused_display_item_changed_event = Event.Event()
@@ -468,6 +473,7 @@ class DocumentController(Window.Window):
         self.__undo_stack = typing.cast(typing.Any, None)
         self.__call_soon_event_listener.close()
         self.__call_soon_event_listener = typing.cast(typing.Any, None)
+        self.__data_file_replacements_stuck_listener = None
         self.__filtered_display_items_model.close()
         self.__filtered_display_items_model = typing.cast(typing.Any, None)
         self.filter_controller.close()
@@ -483,6 +489,40 @@ class DocumentController(Window.Window):
 
     def _register_ui_activity(self) -> None:
         self.__last_activity = time.time()
+
+    # report each stuck data file with the title of its data item, now or in the next dialog if one is open.
+    def __handle_data_file_replacements_stuck(self, stuck_data_files: typing.Sequence[tuple[pathlib.Path, DataItem.DataItem | None]]) -> None:
+        for file_path, data_item in stuck_data_files:
+            title = None
+            if data_item:
+                display_item = self.document_model.get_display_item_for_data_item(data_item)
+                title = display_item.displayed_title if display_item else data_item.title
+            self.__held_stuck_data_file_lines[file_path] = f"{title} ({file_path})" if title else str(file_path)
+        if not self.__is_stuck_data_files_dialog_open:
+            self.__show_stuck_data_files_dialog()
+
+    # show the held stuck data files in a dialog, which doesn't block, and show those held meanwhile once it closes.
+    def __show_stuck_data_files_dialog(self) -> None:
+        if not self.app:
+            self.__held_stuck_data_file_lines.clear()
+            return
+        # a line held while a dialog was open may be for a replace which has since completed.
+        self.__held_stuck_data_file_lines = {path: line for path, line in self.__held_stuck_data_file_lines.items() if self.document_model.is_data_file_replacement_pending(path)}
+        if not self.__held_stuck_data_file_lines:
+            return
+        message = _("Nion Swift can't yet replace the data files of these data items with their new data. Another program probably has the "
+                    "files open, such as a cloud sync client or a virus scanner. Nion Swift keeps trying, and the data items show their new data "
+                    "meanwhile. If the files are still open when the project closes, Nion Swift tries again when the project next opens.")
+        message += "\n\n" + "\n".join(self.__held_stuck_data_file_lines.values())
+        self.__held_stuck_data_file_lines.clear()
+
+        def handle_close() -> None:
+            self.__is_stuck_data_files_dialog_open = False
+            if self.__held_stuck_data_file_lines and not self.__closed:
+                self.__show_stuck_data_files_dialog()
+
+        self.__is_stuck_data_files_dialog_open = True
+        self.app.show_ok_dialog(_("Data Files In Use"), message, completion_fn=handle_close)
 
     # report a data item which can't be restored, which stays removed, in a dialog which doesn't block.
     def __show_undelete_refused_dialog(self, error: Changes.UndeleteRefusedError) -> None:
