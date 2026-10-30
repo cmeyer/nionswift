@@ -301,6 +301,94 @@ class TestHDF5Handler(unittest.TestCase):
                     release_event.set()
                     thread.join()
                 deferred_files.close_released_files()
+                deferred_files._wait_for_syncs()
+                deferred_files.close_released_files()
                 self.assertEqual(["data.h5"], sorted(path.name for path in file_path.parent.iterdir()))
                 self.assertTrue(numpy.array_equal(numpy.ones((6, 4), numpy.float32), numpy.asarray(handler.read_data())))
+            deferred_files.close()
+
+    def test_pending_file_written_through_its_data_handle_after_its_sync_is_requested_replaces_its_file_after_another_sync(self):
+        data_descriptor = DataAndMetadata.DataDescriptor(False, 0, 2)
+        deferred_files = HDF5Handler.HDF5DeferredFiles()
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = pathlib.Path(directory) / "data.h5"
+            handler = HDF5Handler.HDF5Handler(file_path, deferred_files)
+            with contextlib.closing(handler):
+                handler.write_data(numpy.zeros((5, 7), numpy.float32), data_descriptor, datetime.datetime.now())
+                # the reshape goes to a pending file, followed by the properties which describe it, as a data item writes
+                # them. a pass requests its sync, and a partial update writes through the data handle once it has run.
+                handler.write_data(numpy.zeros((6, 4), numpy.float32), data_descriptor, datetime.datetime.now())
+                handler.write_properties({"data_shape": [6, 4], "data_dtype": "float32"}, datetime.datetime.now())
+                deferred_files.close_released_files()
+                deferred_files._wait_for_syncs()
+                data_handle = handler.read_data()
+                assert data_handle is not None
+                data_handle[1] = numpy.ones((4,), numpy.float32)
+                data_handle = None
+                # the sync doesn't cover the write, so the next pass requests another, and the pass after it completes the
+                # replacement.
+                deferred_files.close_released_files()
+                self.assertEqual(2, len(list(file_path.parent.iterdir())))
+                deferred_files._wait_for_syncs()
+                deferred_files.close_released_files()
+                self.assertEqual(["data.h5"], sorted(path.name for path in file_path.parent.iterdir()))
+            deferred_files.close()
+
+    @unittest.skipIf(sys.platform == "win32", "Windows doesn't make a file read-only with chmod as POSIX does.")
+    def test_pending_file_whose_sync_is_refused_is_deleted_at_close_and_its_file_keeps_its_previous_data(self):
+        data_descriptor = DataAndMetadata.DataDescriptor(False, 0, 2)
+        deferred_files = HDF5Handler.HDF5DeferredFiles()
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = pathlib.Path(directory) / "data.h5"
+            handler = HDF5Handler.HDF5Handler(file_path, deferred_files)
+            try:
+                handler.write_data(numpy.ones((5, 7), numpy.float32), data_descriptor, datetime.datetime.now())
+                handler.write_properties({"data_shape": [5, 7]}, datetime.datetime.now())
+                # the reshape goes to a pending file, followed by its properties. the file is read-only, so its syncs are
+                # refused, and the passes leave it pending.
+                handler.write_data(numpy.zeros((6, 4), numpy.float32), data_descriptor, datetime.datetime.now())
+                handler.write_properties({"data_shape": [6, 4]}, datetime.datetime.now())
+                pending_file_path = next(path for path in file_path.parent.iterdir() if path != file_path)
+                pending_file_path.chmod(0o444)
+                for index in range(3):
+                    deferred_files.close_released_files()
+                    deferred_files._wait_for_syncs()
+                self.assertTrue(pending_file_path.exists())
+            finally:
+                # the close gives up on the sync and deletes the pending file, and the file keeps its previous data.
+                handler.close()
+                deferred_files.close()
+            self.assertEqual(["data.h5"], sorted(path.name for path in file_path.parent.iterdir()))
+            handler = HDF5Handler.HDF5Handler(file_path)
+            with contextlib.closing(handler):
+                self.assertEqual({"data_shape": [5, 7]}, handler.read_properties())
+                self.assertTrue(numpy.array_equal(numpy.ones((5, 7), numpy.float32), numpy.asarray(handler.read_data())))
+
+    @unittest.skipIf(sys.platform == "win32", "Windows doesn't make a file read-only with chmod as POSIX does.")
+    def test_pending_file_whose_sync_is_refused_replaces_its_file_once_a_sync_succeeds(self):
+        data_descriptor = DataAndMetadata.DataDescriptor(False, 0, 2)
+        deferred_files = HDF5Handler.HDF5DeferredFiles()
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = pathlib.Path(directory) / "data.h5"
+            handler = HDF5Handler.HDF5Handler(file_path, deferred_files)
+            with contextlib.closing(handler):
+                handler.write_data(numpy.ones((5, 7), numpy.float32), data_descriptor, datetime.datetime.now())
+                handler.write_properties({"data_shape": [5, 7]}, datetime.datetime.now())
+                # the reshape goes to a pending file, followed by its properties. the file is read-only, so its syncs are
+                # refused, and the passes leave it pending.
+                handler.write_data(numpy.zeros((6, 4), numpy.float32), data_descriptor, datetime.datetime.now())
+                handler.write_properties({"data_shape": [6, 4]}, datetime.datetime.now())
+                pending_file_path = next(path for path in file_path.parent.iterdir() if path != file_path)
+                pending_file_path.chmod(0o444)
+                for index in range(3):
+                    deferred_files.close_released_files()
+                    deferred_files._wait_for_syncs()
+                self.assertTrue(pending_file_path.exists())
+                # once the file is writable again, a pass syncs it, and the pass after it completes the replacement.
+                pending_file_path.chmod(0o644)
+                deferred_files.close_released_files()
+                deferred_files._wait_for_syncs()
+                deferred_files.close_released_files()
+                self.assertEqual(["data.h5"], sorted(path.name for path in file_path.parent.iterdir()))
+                self.assertEqual({"data_shape": [6, 4]}, handler.read_properties())
             deferred_files.close()
