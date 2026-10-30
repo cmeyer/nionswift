@@ -855,6 +855,15 @@ class HDF5DeferredFiles:
             fp["data"].attrs[_READY_CANONICAL_MODIFIED_ATTRIBUTE] = canonical_modified
         _sync_file(pending_file_path)
 
+    def get_handlers_waiting_for_data_handle(self) -> list[HDF5Handler]:
+        """Return the handlers whose pending file is ready to replace its canonical file but for its held data handle.
+
+        Main thread only. A handler busy on another thread is left out until a later call.
+        """
+        with self.__lock:
+            pending_files = list(self.__pending_files.values())
+        return [handler for _, handler_ref, _ in pending_files if (handler := handler_ref() if handler_ref else None) and handler._is_waiting_for_data_handle_unless_busy()]
+
     def __complete_pending_files(self) -> None:
         # main thread only. a handler completes its own replacement unless it is busy on another thread, and is then
         # skipped until the next pass. a replacement left by a closed handler completes once this process has closed both
@@ -863,7 +872,7 @@ class HDF5DeferredFiles:
             pending_files = list(self.__pending_files.items())
         for pending_file_path, (canonical_file_path, handler_ref, _) in pending_files:
             if handler := handler_ref() if handler_ref else None:
-                handler._complete_pending_file_unless_busy()
+                handler.complete_pending_file_unless_busy()
             elif not pending_file_path.exists():
                 self.remove_pending_file(pending_file_path)
             elif handler_ref is not None:
@@ -1181,31 +1190,44 @@ class HDF5Handler(StorageHandler.StorageHandler):
     # complete a pending replacement when a sync covers the writes into the described pending file, the canonical file is
     # not open in this process and the pending file's data handle is not held: the pending file is closed and replaces
     # the canonical file, which becomes the current file again, opened when next used. a refused replacement leaves the
-    # handler pending, to be tried again by a later pass of the deferred files. under the lock.
-    def __complete_pending_file(self) -> None:
+    # handler pending, to be tried again by a later pass of the deferred files. return whether it completed. under the
+    # lock.
+    def __complete_pending_file(self) -> bool:
         if not self.__is_pending_file_synced() or self.__get_data_handle() is not None or HDF5FileEntry.is_path_open(self.__canonical_file_path):
-            return
+            return False
         self.__dataset = None
         self.__data_handle_ref = None
         self.__file.close()
         try:
             move_data_file(self.__current_file_path, self.__canonical_file_path, replace=True)
         except OSError:
-            return
+            return False
         self.__deferred_files.remove_pending_file(self.__current_file_path)
         self.__current_file_path = self.__canonical_file_path
         self.__file = HDF5FileEntry(self.__current_file_path, locking=self.__file_locking)
         self.__pending_file_sync = None
         self.__pending_file_last_write = None
+        return True
 
     # request the sync of a described pending file which is due, and complete the pending replacement if it can, unless
-    # another thread holds the lock.
-    def _complete_pending_file_unless_busy(self) -> None:
+    # another thread holds the lock; return whether it completed.
+    def complete_pending_file_unless_busy(self) -> bool:
         if self.__lock.acquire(blocking=False):
             try:
-                self.__complete_pending_file()
+                return self.__complete_pending_file()
             finally:
                 self.__lock.release()
+        return False
+
+    # whether the pending replacement waits only for the holders of its data handle to let go, unless another thread
+    # holds the lock, which counts as not waiting. main thread only.
+    def _is_waiting_for_data_handle_unless_busy(self) -> bool:
+        if self.__lock.acquire(blocking=False):
+            try:
+                return self.__is_pending_file_synced() and self.__get_data_handle() is not None and not HDF5FileEntry.is_path_open(self.__canonical_file_path)
+            finally:
+                self.__lock.release()
+        return False
 
     # whether the current file is a pending file which holds the properties which describe its data, and a finished sync
     # on the sync thread covers every write into it which finished before the sync was requested. a call once the file
