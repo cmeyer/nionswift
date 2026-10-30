@@ -1734,6 +1734,81 @@ class TestStorageClass(unittest.TestCase):
             with document_model.ref():
                 self.assertTrue(numpy.array_equal(expected, document_model.data_items[0].data))
 
+    def test_displayed_hdf5_data_reserved_with_new_shape_and_partially_updated_replaces_its_file_once_it_has_had_no_writes_for_the_sync_delay(self):
+        stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
+        data_metadata = DataAndMetadata.DataMetadata(data_shape_and_dtype=((4, 6, 5), numpy.dtype(numpy.float32)), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
+        expected = numpy.stack([numpy.full((6, 5), index + 1.0, numpy.float32) for index in range(4)])
+        clock_time = [100.0]
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0, pending_file_sync_delay=2.0, clock=lambda: clock_time[0]) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                # the item is displayed, so it keeps the data it loads, which is the reserved data in the pending file.
+                display_data_channel = document_model.get_display_item_for_data_item(data_item).display_data_channels[0]
+                display_data_channel.increment_display_ref_count()
+                data_item.reserve_data(data_shape=(4, 6, 5), data_dtype=numpy.dtype(numpy.float32), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
+                for index in range(4):
+                    clock_time[0] += 1.0
+                    frame = DataAndMetadata.new_data_and_metadata(numpy.full((6, 5), index + 1.0, numpy.float32))
+                    data_item.set_data_and_metadata_partial(data_metadata, frame, (slice(None), slice(None)), (slice(index, index + 1), slice(None), slice(None)))
+                    document_model.close_released_files()
+                    document_model._project.project_storage_system._wait_for_file_syncs()
+                # once the sync delay passes after the last frame, a pass requests the sync, and the next replaces the
+                # item's file while the item is still displayed.
+                clock_time[0] += 2.0
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
+                document_model.close_released_files()
+                self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+                self.assertTrue(numpy.array_equal(expected, data_item.data))
+                display_data_channel.decrement_display_ref_count()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(expected, document_model.data_items[0].data))
+
+    def test_copy_of_project_made_while_a_transaction_pauses_after_a_reserve_of_hdf5_data_loads_data_with_its_properties(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        frame = DataAndMetadata.new_data_and_metadata(numpy.random.default_rng(59).random((6, 5)).astype(numpy.float32))
+        data_metadata = DataAndMetadata.DataMetadata(data_shape_and_dtype=((4, 6, 5), numpy.dtype(numpy.float32)), data_descriptor=DataAndMetadata.DataDescriptor(False, 1, 2), metadata={"generation": 2})
+        # a large format size of 0 stores any data in HDF5.
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False, clock=lambda: clock_time[0]) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.new_data_item(DataAndMetadata.new_data_and_metadata(stored, metadata={"generation": 1})))
+            document_model = profile_context.create_document_model(auto_close=False)
+            profile = typing.cast(Profile.Profile, document_model._profile_for_test)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                # the reserve and its properties go to a pending file. an acquisition writes frames into it in a
+                # transaction, which pauses for longer than the sync delay after the first.
+                data_item.reserve_data(data_shape=(4, 6, 5), data_dtype=numpy.dtype(numpy.float32), data_descriptor=DataAndMetadata.DataDescriptor(False, 1, 2))
+                with document_model.item_transaction(data_item):
+                    data_item.set_data_and_metadata_partial(data_metadata, frame, (slice(None), slice(None)), (slice(0, 1), slice(None), slice(None)), update_metadata=True)
+                    document_model.close_released_files()
+                    clock_time[0] += 5.0
+                    document_model.close_released_files()
+                    document_model._project.project_storage_system._wait_for_file_syncs()
+                    document_model.close_released_files()
+                    data_item.set_data_and_metadata_partial(data_metadata, frame, (slice(None), slice(None)), (slice(1, 2), slice(None), slice(None)), update_metadata=True)
+                    # copy the project during the transaction, as a crash would leave it.
+                    shutil.copy(profile_context.projects_dir / "Project.nsproj", profile_context.projects_dir / "Crash.nsproj")
+                    shutil.copytree(profile_context.projects_dir / "Project Data", profile_context.projects_dir / "Crash Data")
+            # the copy loads the data of one of the changes with the properties which describe it.
+            project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
+            profile.read_project(project_reference)
+            crash_data_item = project_reference.document_model.data_items[0]
+            if crash_data_item.metadata["generation"] == 1:
+                self.assertTrue(numpy.array_equal(stored, crash_data_item.data))
+            else:
+                self.assertEqual((4, 6, 5), crash_data_item.data_shape)
+                self.assertTrue(numpy.array_equal(frame.data, crash_data_item.data[0]))
+
     def test_hdf5_data_reserved_over_existing_data_while_unheld_leaves_only_its_file_with_the_new_data(self):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.

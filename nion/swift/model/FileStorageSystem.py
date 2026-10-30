@@ -685,6 +685,20 @@ class ProjectStorageSystem(PersistentStorageSystem):
         """Close the data files which nobody holds or has used for a while, and do the moves, deletes and replacements waiting for them. Main thread only."""
         pass
 
+    def get_data_item_uuids_holding_pending_files(self) -> typing.Sequence[uuid.UUID]:
+        """Return the uuids of the data items whose pending file waits only for the data item to let go of its loaded data.
+
+        Main thread only.
+        """
+        return list()
+
+    def complete_pending_file(self, data_item_uuid: uuid.UUID) -> bool:
+        """Replace the data item's file with its pending file if it can; return whether it did.
+
+        Main thread only. The caller may hold the data item's lock.
+        """
+        return False
+
     @abc.abstractmethod
     def _get_storage_handler_factory(self, storage_handler_attributes: StorageHandler.StorageHandlerAttributes) -> StorageHandler.StorageHandlerFactoryLike: ...
 
@@ -1071,6 +1085,17 @@ class FileProjectStorageSystem(ProjectStorageSystem):
     def close_released_files(self) -> None:
         self.__hdf5_deferred_files.close_released_files()
         self.__hdf5_idle_files.close_idle_files()
+
+    def get_data_item_uuids_holding_pending_files(self) -> typing.Sequence[uuid.UUID]:
+        handlers = set(self.__hdf5_deferred_files.get_handlers_waiting_for_data_handle())
+        if not handlers:
+            return list()
+        return [data_item_uuid for data_item_uuid, storage_adapter in self._data_properties_map.items() if storage_adapter.storage_handler in handlers]
+
+    def complete_pending_file(self, data_item_uuid: uuid.UUID) -> bool:
+        storage_adapter = self._data_properties_map.get(data_item_uuid)
+        storage_handler = storage_adapter.storage_handler if storage_adapter else None
+        return isinstance(storage_handler, HDF5Handler.HDF5Handler) and storage_handler.complete_pending_file_unless_busy()
 
     def _wait_for_file_syncs(self) -> None:
         # wait until the HDF5 file syncs requested so far have run. for testing.
