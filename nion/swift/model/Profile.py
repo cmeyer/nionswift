@@ -263,7 +263,8 @@ class IndexProjectReference(ProjectReference):
             settings = project_storage_settings or FileStorageSystem.ProjectStorageSettings()
             return FileStorageSystem.make_index_project_storage_system(project_path, large_format_size=settings.large_format_size, idle_file_delay=settings.idle_file_delay,
                                                                        pending_file_sync_delay=settings.pending_file_sync_delay, clock=settings.clock,
-                                                                       hdf5_file_locking=settings.hdf5_file_locking)
+                                                                       hdf5_file_locking=settings.hdf5_file_locking, close_replace_timeout=settings.close_replace_timeout,
+                                                                       close_retry_wait=settings.close_retry_wait)
         return None
 
     def _get_last_used(self) -> datetime.datetime:

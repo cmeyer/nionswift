@@ -243,15 +243,18 @@ class FileProfileContext:
     is set. Projects read through this context store data above large_format_size bytes in HDF5 and smaller data in ndata, close
     a data file once it has been idle for idle_file_delay by the clock, and sync a pending HDF5 file once it has had no writes
     for pending_file_sync_delay. Without hdf5_file_locking, HDF5 doesn't lock the files it has open, so that a test can copy a
-    project folder while its files are open, as Windows otherwise refuses.
+    project folder while its files are open, as Windows otherwise refuses. Closing a project tries the refused replaces of HDF5
+    files by their pending files again for close_replace_timeout seconds, waiting between tries with close_retry_wait.
     """
 
     def __init__(self, base_directory: pathlib.Path, no_remove: bool = False, *, large_format_size: int = FileStorageSystem.DEFAULT_LARGE_FORMAT_SIZE,
                  idle_file_delay: float = FileStorageSystem.DEFAULT_IDLE_FILE_DELAY, pending_file_sync_delay: float = FileStorageSystem.DEFAULT_PENDING_FILE_SYNC_DELAY,
-                 clock: typing.Callable[[], float] | None = None, hdf5_file_locking: bool = True) -> None:
+                 clock: typing.Callable[[], float] | None = None, hdf5_file_locking: bool = True, close_replace_timeout: float = FileStorageSystem.DEFAULT_CLOSE_REPLACE_TIMEOUT,
+                 close_retry_wait: typing.Callable[[float], None] = time.sleep) -> None:
         self.project_storage_settings = FileStorageSystem.ProjectStorageSettings(large_format_size=large_format_size, idle_file_delay=idle_file_delay,
                                                                                  pending_file_sync_delay=pending_file_sync_delay, clock=clock or time.monotonic,
-                                                                                 hdf5_file_locking=hdf5_file_locking)
+                                                                                 hdf5_file_locking=hdf5_file_locking, close_replace_timeout=close_replace_timeout,
+                                                                                 close_retry_wait=close_retry_wait)
         self.workspace_dir = base_directory / "__Test"
         self.profiles_dir = base_directory / "__Test" / "Profiles"
         self.projects_dir = base_directory / "__Test" / "Projects"
