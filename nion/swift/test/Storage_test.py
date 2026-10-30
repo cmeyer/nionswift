@@ -74,9 +74,10 @@ def memory_usage_resource():
 
 def create_temp_profile_context(no_remove: bool = False, *, large_format_size: int = FileStorageSystem.DEFAULT_LARGE_FORMAT_SIZE,
                                 idle_file_delay: float = FileStorageSystem.DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None,
-                                hdf5_file_locking: bool = True) -> TestContext.FileProfileContext:
+                                hdf5_file_locking: bool = True, close_replace_timeout: float = FileStorageSystem.DEFAULT_CLOSE_REPLACE_TIMEOUT,
+                                close_retry_wait: typing.Callable[[float], None] = time.sleep) -> TestContext.FileProfileContext:
     return TestContext.FileProfileContext(pathlib.Path.cwd(), no_remove=no_remove, large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock,
-                                          hdf5_file_locking=hdf5_file_locking)
+                                          hdf5_file_locking=hdf5_file_locking, close_replace_timeout=close_replace_timeout, close_retry_wait=close_retry_wait)
 
 
 # a test of a refused delete or replace locks the file. Linux has no lock which refuses either.
@@ -130,6 +131,27 @@ class _FileLock:
             elif hasattr(os, "chflags"):
                 os.chflags(self.__file_path, 0)
             self.__is_locked = False
+
+
+def _close_project_with_ready_file(profile_context: TestContext.FileProfileContext, stored: numpy.typing.NDArray[typing.Any], replacement: numpy.typing.NDArray[typing.Any]) -> pathlib.Path:
+    # save a data item, reshape it while its data is held, and close the project while its locked file refuses the replace,
+    # so that the pending file becomes the ready file. return the path of the item's file. any dtype will do.
+    document_model = profile_context.create_document_model(auto_close=False)
+    with document_model.ref():
+        document_model.append_data_item(DataItem.DataItem(stored))
+        file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+    document_model = profile_context.create_document_model(auto_close=False)
+    file_lock = _FileLock(file_path)
+    try:
+        with document_model.ref():
+            data_item = document_model.data_items[0]
+            data_handle = data_item.data
+            data_item.set_data(replacement)
+            file_lock.lock()
+        data_handle = None
+    finally:
+        file_lock.unlock()
+    return file_path
 
 
 def create_memory_profile_context() -> TestContext.MemoryProfileContext:
@@ -2161,8 +2183,8 @@ class TestStorageClass(unittest.TestCase):
     def test_project_closed_while_the_folder_refuses_the_replace_of_hdf5_data_reshaped_while_held_loads_the_old_data(self):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
-        # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0) as profile_context:
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.new_data_item(DataAndMetadata.new_data_and_metadata(stored, metadata={"generation": 1})))
@@ -2185,6 +2207,510 @@ class TestStorageClass(unittest.TestCase):
             with document_model.ref():
                 self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
                 self.assertEqual({"generation": 1}, document_model.data_items[0].metadata)
+            self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_project_closed_while_the_locked_item_file_refuses_the_replace_of_hdf5_data_reshaped_while_held_loads_the_new_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.new_data_item(DataAndMetadata.new_data_and_metadata(stored, metadata={"generation": 1})))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_lock = _FileLock(file_path)
+            try:
+                with document_model.ref():
+                    data_item = document_model.data_items[0]
+                    # the old data is held, so the new data waits in a pending file until the project closes, when the
+                    # locked item's file refuses the replace, as Windows refuses it while another process has the file open.
+                    data_handle = data_item.data
+                    data_item.set_xdata(DataAndMetadata.new_data_and_metadata(replacement, metadata={"generation": 2}))
+                    file_lock.lock()
+                # the old data stays held until the project has closed.
+                data_handle = None
+            finally:
+                file_lock.unlock()
+            # an earlier version, which skips hidden files, finds only the item's file, with the old data.
+            self.assertEqual([file_path.name], [path.name for path in file_path.parent.iterdir() if not path.name.startswith(".")])
+            # the next load has the new data with its properties, and keeps one file.
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+                self.assertEqual({"generation": 2}, document_model.data_items[0].metadata)
+            self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_project_closed_while_the_locked_item_file_refuses_the_replace_for_a_moment_leaves_only_its_file_with_the_new_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        file_locks = list[_FileLock]()
+        # a large format size of 0 stores any data in HDF5. the locked item's file refuses the replace until the close
+        # waits to try it again.
+        with create_temp_profile_context(large_format_size=0, close_retry_wait=lambda seconds: file_locks[0].unlock()) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_locks.append(_FileLock(file_path))
+            try:
+                with document_model.ref():
+                    document_model.data_items[0].set_data(replacement)
+                    file_locks[0].lock()
+            finally:
+                file_locks[0].unlock()
+            # the item's file has the new data, as an earlier version loads it.
+            self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+            with h5py.File(file_path, "r") as f:
+                self.assertEqual((4, 6, 5), f["data"].shape)
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_project_closed_while_another_program_holds_the_item_file_and_the_synced_pending_file_loads_the_old_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, idle_file_delay=5.0, clock=lambda: clock_time[0], close_replace_timeout=0.0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.new_data_item(DataAndMetadata.new_data_and_metadata(stored, metadata={"generation": 1})))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_locks = [_FileLock(file_path)]
+            try:
+                with document_model.ref():
+                    document_model.data_items[0].set_xdata(DataAndMetadata.new_data_and_metadata(replacement, metadata={"generation": 2}))
+                    file_locks[0].lock()
+                    # once the pending file is synced, the program holds it too, which refuses its rename to the ready
+                    # file through the close.
+                    clock_time[0] += 5.0
+                    document_model.close_released_files()
+                    document_model._project.project_storage_system._wait_for_file_syncs()
+                    file_locks.append(_FileLock(next(file_path.parent.glob(".*.h5"))))
+                    file_locks[1].lock()
+            finally:
+                for file_lock in file_locks:
+                    file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+                self.assertEqual({"generation": 1}, document_model.data_items[0].metadata)
+            self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_project_closed_while_another_program_holds_the_item_file_against_reads_and_its_replace_loads_the_new_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with document_model.ref():
+                    # the reshape closes the item's file, which the other program then opens.
+                    document_model.data_items[0].set_data(replacement)
+                    file_lock.lock()
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_project_closed_while_another_program_holds_the_item_file_after_two_reshapes_loads_the_newest_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        newer = numpy.random.default_rng(60).random((2, 2, 2)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with document_model.ref():
+                    document_model.data_items[0].set_data(replacement)
+                    document_model.data_items[0].set_data(newer)
+                    file_lock.lock()
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(newer, document_model.data_items[0].data))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_project_closed_while_another_program_holds_the_item_file_after_an_earlier_replace_loads_the_newest_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        newer = numpy.random.default_rng(60).random((2, 2, 2)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0, idle_file_delay=5.0, clock=lambda: clock_time[0]) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with document_model.ref():
+                    # the first new data replaces the item's file, which then has a new modified time.
+                    document_model.data_items[0].set_data(replacement)
+                    clock_time[0] += 5.0
+                    document_model.close_released_files()
+                    document_model._project.project_storage_system._wait_for_file_syncs()
+                    document_model.close_released_files()
+                    document_model.data_items[0].set_data(newer)
+                    file_lock.lock()
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(newer, document_model.data_items[0].data))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_project_closed_while_the_locked_item_file_refuses_the_replace_of_hdf5_data_keeps_a_later_change_to_the_item_file(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_lock = _FileLock(file_path)
+            try:
+                with document_model.ref():
+                    data_item = document_model.data_items[0]
+                    # the old data is held, so the new data waits in a pending file until the project closes, when the
+                    # locked item's file refuses the replace, and the pending file becomes the ready file.
+                    data_handle = data_item.data
+                    data_item.set_data(replacement)
+                    file_lock.lock()
+                data_handle = None
+            finally:
+                file_lock.unlock()
+            # a load without the ready file, standing in for an earlier version which skips hidden files, changes the item.
+            ready_file_path = HDF5Handler.get_ready_file_path(file_path)
+            aside_file_path = profile_context.workspace_dir / ready_file_path.name
+            shutil.move(ready_file_path, aside_file_path)
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.data_items[0].title = "changed"
+            shutil.move(aside_file_path, ready_file_path)
+            # the machine which ran the earlier version had a clock behind, so the change has an earlier stored time.
+            with h5py.File(file_path, "r+") as fp:
+                properties = json.loads(fp["data"].attrs["properties"])
+                properties["modified"] = "2000-01-01T00:00:00"
+                fp["data"].attrs["properties"] = json.dumps(properties)
+            # the change is kept and the ready file is deleted.
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual("changed", document_model.data_items[0].title)
+                self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+            self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_project_loaded_while_the_locked_item_file_still_refuses_the_replace_of_hdf5_data_reshaped_while_held_loads_the_new_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, idle_file_delay=5.0, clock=lambda: clock_time[0], close_replace_timeout=0.0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.new_data_item(DataAndMetadata.new_data_and_metadata(stored, metadata={"generation": 1})))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_lock = _FileLock(file_path)
+            try:
+                with document_model.ref():
+                    data_item = document_model.data_items[0]
+                    # the old data is held, so the new data waits in a pending file until the project closes, when the
+                    # locked item's file refuses the replace.
+                    data_handle = data_item.data
+                    data_item.set_xdata(DataAndMetadata.new_data_and_metadata(replacement, metadata={"generation": 2}))
+                    file_lock.lock()
+                data_handle = None
+                # the item's file is still locked at the next load, which has the new data, and replaces the file once
+                # it is unlocked.
+                document_model = profile_context.create_document_model(auto_close=False)
+                with document_model.ref():
+                    data_item = document_model.data_items[0]
+                    self.assertTrue(numpy.array_equal(replacement, data_item.data))
+                    self.assertEqual({"generation": 2}, data_item.metadata)
+                    file_lock.unlock()
+                    clock_time[0] += 5.0
+                    document_model.close_released_files()
+                    document_model._project.project_storage_system._wait_for_file_syncs()
+                    document_model.close_released_files()
+                    self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_hdf5_data_item_removed_while_pending_on_its_ready_file_stays_removed_at_the_next_load(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            file_path = _close_project_with_ready_file(profile_context, stored, replacement)
+            file_lock = _FileLock(file_path)
+            file_lock.lock()
+            try:
+                document_model = profile_context.create_document_model(auto_close=False)
+                with document_model.ref():
+                    file_lock.unlock()
+                    # the project closes before the ready file can move into the trash.
+                    with contextlib.closing(document_model.remove_data_item_with_log(document_model.data_items[0], safe=True)):
+                        pass
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual(0, len(document_model.data_items))
+            self.assertEqual([], list(file_path.parent.iterdir()))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_ready_file_whose_item_file_an_earlier_version_moved_into_the_trash_is_deleted_at_load(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            file_path = _close_project_with_ready_file(profile_context, stored, replacement)
+            # an earlier version, which skips the ready file, removes the item, whose file moves into the trash.
+            trash_dir = profile_context.projects_dir / "Project Data" / "trash"
+            trash_dir.mkdir(exist_ok=True)
+            shutil.move(file_path, trash_dir / file_path.name)
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual(0, len(document_model.data_items))
+            self.assertEqual([], list(file_path.parent.iterdir()))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_hdf5_data_pending_on_its_ready_file_which_moves_to_ndata_while_the_locked_item_file_refuses_its_delete_loads_the_ndata(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        small = numpy.random.default_rng(60).random((2, 3)).astype(numpy.float32)
+        # data above 256 bytes is stored in HDF5, so the small data moves the item to ndata. the close tries the refused
+        # replace once.
+        with create_temp_profile_context(large_format_size=256, close_replace_timeout=0.0) as profile_context:
+            file_path = _close_project_with_ready_file(profile_context, stored, replacement)
+            file_lock = _FileLock(file_path)
+            file_lock.lock()
+            try:
+                document_model = profile_context.create_document_model(auto_close=False)
+                with document_model.ref():
+                    document_model.data_items[0].set_data(small)
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual(1, len(document_model.data_items))
+                self.assertTrue(numpy.array_equal(small, document_model.data_items[0].data))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_copy_of_project_made_after_a_reshape_of_hdf5_data_pending_on_its_ready_file_loads_the_ready_file(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        newer = numpy.random.default_rng(60).random((2, 2, 2)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False, close_replace_timeout=0.0) as profile_context:
+            file_path = _close_project_with_ready_file(profile_context, stored, replacement)
+            file_lock = _FileLock(file_path)
+            file_lock.lock()
+            try:
+                document_model = profile_context.create_document_model(auto_close=False)
+                profile = typing.cast(Profile.Profile, document_model._profile_for_test)
+                with document_model.ref():
+                    document_model.data_items[0].set_data(newer)
+                    # copy the project while the newer data is pending, as a crash would leave it. copyfile leaves the lock behind.
+                    shutil.copy(profile_context.projects_dir / "Project.nsproj", profile_context.projects_dir / "Crash.nsproj")
+                    shutil.copytree(profile_context.projects_dir / "Project Data", profile_context.projects_dir / "Crash Data", copy_function=shutil.copyfile)
+            finally:
+                file_lock.unlock()
+            crash_file_path = profile_context.projects_dir / "Crash Data" / file_path.relative_to(profile_context.projects_dir / "Project Data")
+            # the data saved last is the ready file's, since the newer data had no sync.
+            project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
+            profile.read_project(project_reference)
+            self.assertTrue(numpy.array_equal(replacement, project_reference.document_model.data_items[0].data))
+            self.assertEqual([crash_file_path.name], sorted(path.name for path in crash_file_path.parent.iterdir()))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_reshape_of_hdf5_data_pending_on_its_ready_file_which_replaces_the_item_file_is_kept_over_the_ready_file(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        newer = numpy.random.default_rng(60).random((2, 2, 2)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            file_path = _close_project_with_ready_file(profile_context, stored, replacement)
+            file_lock = _FileLock(file_path)
+            file_lock.lock()
+            try:
+                document_model = profile_context.create_document_model(auto_close=False)
+                with document_model.ref():
+                    document_model.data_items[0].set_data(newer)
+                    # the newer data replaces the item's file at the close, and the ready file is left behind.
+                    file_lock.unlock()
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(newer, document_model.data_items[0].data))
+            self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_reshape_of_hdf5_data_pending_on_its_ready_file_whose_replace_is_refused_at_close_loads_the_newer_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        newer = numpy.random.default_rng(60).random((2, 2, 2)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            file_path = _close_project_with_ready_file(profile_context, stored, replacement)
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            file_lock.lock()
+            try:
+                document_model = profile_context.create_document_model(auto_close=False)
+                with document_model.ref():
+                    document_model.data_items[0].set_data(newer)
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(newer, document_model.data_items[0].data))
+            self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_change_to_hdf5_data_pending_on_its_ready_file_whose_replace_is_refused_at_close_is_loaded(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            file_path = _close_project_with_ready_file(profile_context, stored, replacement)
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            file_lock.lock()
+            try:
+                document_model = profile_context.create_document_model(auto_close=False)
+                with document_model.ref():
+                    document_model.data_items[0].title = "changed"
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual("changed", document_model.data_items[0].title)
+                self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+            self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_undo_of_removal_while_its_file_refuses_the_mark_and_the_replace_through_the_close_loads_the_new_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with document_model.ref():
+                    document_model.data_items[0].set_data(replacement)
+                    file_lock.lock()
+                    undelete_log = document_model.remove_data_item_with_log(document_model.data_items[0], safe=True)
+                    document_model.undelete_all(undelete_log)
+                    undelete_log.close()
+            finally:
+                file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertEqual(1, len(document_model.display_items))
+                self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_pending_file_whose_rename_to_its_ready_file_is_refused_for_a_moment_at_close_loads_the_new_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        pending_file_locks = list[_FileLock]()
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once, and the program
+        # holding the pending file lets go when the close waits to try its rename again.
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, idle_file_delay=5.0, clock=lambda: clock_time[0], close_replace_timeout=0.0,
+                                         close_retry_wait=lambda seconds: pending_file_locks[0].unlock()) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            file_lock = _FileLock(file_path)
+            try:
+                with document_model.ref():
+                    document_model.data_items[0].set_data(replacement)
+                    file_lock.lock()
+                    # once the pending file is synced, the program holds it too, which refuses its rename to the ready file.
+                    clock_time[0] += 5.0
+                    document_model.close_released_files()
+                    document_model._project.project_storage_system._wait_for_file_syncs()
+                    pending_file_locks.append(_FileLock(next(file_path.parent.glob(".*.h5"))))
+                    pending_file_locks[0].lock()
+            finally:
+                file_lock.unlock()
+                for pending_file_lock in pending_file_locks:
+                    pending_file_lock.unlock()
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_ready_file_whose_sync_is_refused_at_close_keeps_its_data_for_the_next_load(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            file_path = _close_project_with_ready_file(profile_context, stored, replacement)
+            ready_file_path = HDF5Handler.get_ready_file_path(file_path)
+            file_lock = _FileLock(file_path)
+            file_lock.lock()
+            try:
+                document_model = profile_context.create_document_model(auto_close=False)
+                with document_model.ref():
+                    # a read only file stands in for another program whose hold refuses the sync. it is made read only
+                    # while the data, and so the file, is open.
+                    data_handle = document_model.data_items[0].data
+                    os.chmod(ready_file_path, stat.S_IREAD)
+                data_handle = None
+            finally:
+                file_lock.unlock()
+                os.chmod(ready_file_path, stat.S_IREAD | stat.S_IWRITE)
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_ready_file_which_can_not_be_read_keeps_the_item_file(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replace once.
+        with create_temp_profile_context(large_format_size=0, close_replace_timeout=0.0) as profile_context:
+            file_path = _close_project_with_ready_file(profile_context, stored, replacement)
+            ready_file_path = HDF5Handler.get_ready_file_path(file_path)
+            os.truncate(ready_file_path, ready_file_path.stat().st_size // 2)
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
             self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
 
     def test_copy_of_project_made_while_hdf5_data_is_pending_keeps_a_later_change_to_the_file_and_deletes_the_pending_file(self):

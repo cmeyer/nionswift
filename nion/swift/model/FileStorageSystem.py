@@ -57,6 +57,9 @@ DEFAULT_LARGE_FORMAT_SIZE = 16 * 1024 * 1024
 # a data file whose data nobody holds closes once it has been idle for this many seconds.
 DEFAULT_IDLE_FILE_DELAY = 5.0
 
+# closing a project tries the refused replaces of HDF5 files by their pending files again for this many seconds in all.
+DEFAULT_CLOSE_REPLACE_TIMEOUT = 2.0
+
 
 @dataclasses.dataclass(frozen=True)
 class ProjectStorageSettings:
@@ -76,6 +79,12 @@ class ProjectStorageSettings:
 
     hdf5_file_locking: bool = True
     """Whether HDF5 locks the data files it has open, as it does by default."""
+
+    close_replace_timeout: float = DEFAULT_CLOSE_REPLACE_TIMEOUT
+    """The time in seconds for which closing the project tries the refused replaces of HDF5 files by their pending files again."""
+
+    close_retry_wait: typing.Callable[[float], None] = time.sleep
+    """The function with which closing the project waits between its tries of refused replaces and renames, given the time in seconds."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1021,27 +1030,30 @@ class FileProjectStorageSystem(ProjectStorageSystem):
 
     def __init__(self, project_path: pathlib.Path, project_data_path: pathlib.Path | None = None, *,
                  large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE, idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None,
-                 hdf5_file_locking: bool = True) -> None:
+                 hdf5_file_locking: bool = True, close_replace_timeout: float = DEFAULT_CLOSE_REPLACE_TIMEOUT,
+                 close_retry_wait: typing.Callable[[float], None] = time.sleep) -> None:
         """Make the storage system of the project at project_path.
 
         Data above large_format_size bytes is stored in HDF5. A data file whose data nobody holds closes once it has
         been idle for idle_file_delay seconds, and a pending HDF5 file is synced once it has had no writes for as long.
         The clock returns the current time in seconds, and defaults to time.monotonic. HDF5 locks the files it has open
-        unless hdf5_file_locking is False.
+        unless hdf5_file_locking is False. Closing the project tries the refused replaces of HDF5 files by their pending
+        files again for close_replace_timeout seconds, waiting between tries with close_retry_wait.
         """
         super().__init__()
         self.__project_path = project_path
         self.__project_data_path = project_data_path
         self.__large_format_size = large_format_size
         # HDF5 files given up while in use, and files waiting to be renamed or deleted, until nothing has them open.
-        self.__hdf5_deferred_files = HDF5Handler.HDF5DeferredFiles(sync_delay=idle_file_delay, clock=clock or time.monotonic, file_locking=hdf5_file_locking)
+        self.__hdf5_deferred_files = HDF5Handler.HDF5DeferredFiles(sync_delay=idle_file_delay, clock=clock or time.monotonic, close_replace_timeout=close_replace_timeout,
+                                                                  close_retry_wait=close_retry_wait, file_locking=hdf5_file_locking)
         # current HDF5 files whose data nobody holds close here once idle.
         self.__hdf5_idle_files = HDF5Handler.HDF5IdleFiles(delay=idle_file_delay, clock=clock or time.monotonic)
         self.__hdf5_handler_factory = HDF5Handler.HDF5HandlerFactory(self.__hdf5_deferred_files, self.__hdf5_idle_files, file_locking=hdf5_file_locking)
         self._file_handler_factories = [NDataHandler.NDataHandlerFactory(), self.__hdf5_handler_factory]
         # the files of data items restored where they are, by data item uuid, until the data items are inserted: the
         # canonical file, and the pending file which replaces it, if any. main thread only.
-        self.__restored_file_paths: dict[uuid.UUID, tuple[pathlib.Path, pathlib.Path | None]] = dict()
+        self.__restored_file_paths: dict[uuid.UUID, tuple[pathlib.Path, pathlib.Path | None, str | None]] = dict()
 
     def close(self) -> None:
         super().close()
@@ -1175,9 +1187,9 @@ class FileProjectStorageSystem(ProjectStorageSystem):
                 self.__hdf5_deferred_files.add_removed_file(removed_file)
                 raise
             if removed_file.canonical_file_path is not None:
-                self.__restored_file_paths[data_item_uuid] = (removed_file.canonical_file_path, removed_file.file_path)
+                self.__restored_file_paths[data_item_uuid] = (removed_file.canonical_file_path, removed_file.file_path, removed_file.canonical_modified)
             else:
-                self.__restored_file_paths[data_item_uuid] = (removed_file.file_path, None)
+                self.__restored_file_paths[data_item_uuid] = (removed_file.file_path, None, None)
             return Migration.transform_to_latest(storage_handler_properties)
         trash_dir = self.__project_data_path / "trash"
         # a data file in the trash is normally named for its data item, so only that file is read. files named
@@ -1293,7 +1305,9 @@ class FileProjectStorageSystem(ProjectStorageSystem):
                             pending_file_path, _ = HDF5Handler.find_pending_file_path(pathlib.Path(new_file_path), 1)
                             storage_handler.prepare_move()  # moving files in the storage handler requires it to be closed.
                             HDF5Handler.move_data_file(pathlib.Path(old_file_path), pending_file_path, reason=f"data item {data_item_uuid} restored")
-                            self.__restored_file_paths[data_item_uuid] = (pathlib.Path(new_file_path), pending_file_path)
+                            canonical_properties = self.__hdf5_handler_factory.read_file_properties(pathlib.Path(new_file_path))
+                            canonical_modified = HDF5Handler.get_stored_modified_json(canonical_properties) if canonical_properties is not None else None
+                            self.__restored_file_paths[data_item_uuid] = (pathlib.Path(new_file_path), pending_file_path, canonical_modified)
                         return properties
         finally:
             for storage_handler in storage_handlers:
@@ -1336,9 +1350,9 @@ class FileProjectStorageSystem(ProjectStorageSystem):
 
     def _take_restored_storage_handler(self, data_item_uuid: uuid.UUID) -> StorageHandler.StorageHandler | None:
         if (restored_file_paths := self.__restored_file_paths.pop(data_item_uuid, None)) is not None:
-            file_path, pending_file_path = restored_file_paths
+            file_path, pending_file_path, canonical_modified = restored_file_paths
             if pending_file_path is not None:
-                return self.__hdf5_handler_factory.make_pending(file_path, pending_file_path)
+                return self.__hdf5_handler_factory.make_pending(file_path, pending_file_path, canonical_modified)
             return self.__hdf5_handler_factory.make(file_path)
         return None
 
@@ -1451,9 +1465,11 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         return None
 
     def __find_storage_handlers(self, directory: pathlib.Path | None, *, skip_trash: bool = True, is_load: bool = False) -> typing.Sequence[StorageHandler.StorageHandler]:
-        # at load, for the data folder, the pending files found are deleted first.
+        # at load, for the data folder, the pending files found are deleted and the ready files replace their canonical
+        # files first.
         absolute_file_paths = set()
         pending_file_paths = list[pathlib.Path]()
+        ready_file_paths = list[pathlib.Path]()
         if directory and directory.exists():
             for file_path in directory.rglob("*"):
                 if not skip_trash or file_path.parent.name != "trash":
@@ -1461,9 +1477,13 @@ class FileProjectStorageSystem(ProjectStorageSystem):
                         absolute_file_paths.add(str(file_path))
                     elif HDF5Handler.get_canonical_file_path(file_path):
                         pending_file_paths.append(file_path)
+                    elif HDF5Handler.get_ready_canonical_file_path(file_path):
+                        ready_file_paths.append(file_path)
+        refused_ready_file_paths: typing.Mapping[str, tuple[pathlib.Path, str | None]] = dict()
         if is_load:
             self.__delete_pending_files(pending_file_paths)
-        return self.__make_storage_handlers(absolute_file_paths)
+            refused_ready_file_paths = self.__complete_ready_files(ready_file_paths)
+        return self.__make_storage_handlers(absolute_file_paths, refused_ready_file_paths)
 
     def __delete_pending_files(self, pending_file_paths: typing.Sequence[pathlib.Path]) -> None:
         """Delete the pending files which a session left behind, at load, on the main thread.
@@ -1479,13 +1499,64 @@ class FileProjectStorageSystem(ProjectStorageSystem):
                 except OSError as e:
                     logging.getLogger("loader").warning(f"Unable to delete pending data file {pending_file_path} ({e}).")
 
-    def __make_storage_handlers(self, absolute_file_paths: typing.AbstractSet[str]) -> typing.Sequence[StorageHandler.StorageHandler]:
-        # make a storage handler for each of the files which is a data file.
+    def __complete_ready_files(self, ready_file_paths: typing.Sequence[pathlib.Path]) -> typing.Mapping[str, tuple[pathlib.Path, str | None]]:
+        """Replace the canonical file of each ready file which a closed session left, at load, on the main thread.
+
+        A ready file whose canonical file is gone, as when an earlier version removed its data item, is deleted, and so is
+        one which isn't current. Returns the ready files whose replace is refused, each with the canonical file's stored
+        modified time which it records, by the path of their canonical files.
+        """
+        refused_ready_file_paths = dict[str, tuple[pathlib.Path, str | None]]()
+        for ready_file_path in ready_file_paths:
+            canonical_file_path = HDF5Handler.get_ready_canonical_file_path(ready_file_path)
+            assert canonical_file_path is not None
+            recorded_modified = self.__hdf5_handler_factory.read_ready_canonical_modified(ready_file_path)
+            if canonical_file_path.exists() and not self.__is_ready_file_current(recorded_modified, canonical_file_path):
+                try:
+                    HDF5Handler.move_data_file(ready_file_path, None, reason="ready file not current, at load")
+                    logging.getLogger("loader").warning(f"Discarded the new data of data file {canonical_file_path}, which an earlier close left in {ready_file_path.name}, "
+                                                        "since the data file has changed since or the new data can't be read.")
+                except OSError as e:
+                    logging.getLogger("loader").warning(f"Unable to delete ready data file {ready_file_path} ({e}).")
+                continue
+            try:
+                if canonical_file_path.exists():
+                    HDF5Handler.move_data_file(ready_file_path, canonical_file_path, replace=True)
+                else:
+                    HDF5Handler.move_data_file(ready_file_path, None)
+            except OSError as e:
+                logging.getLogger("loader").warning(f"Unable to complete ready data file {ready_file_path} ({e}).")
+                if canonical_file_path.exists():
+                    refused_ready_file_paths[str(canonical_file_path)] = (ready_file_path, recorded_modified)
+        return refused_ready_file_paths
+
+    def __is_ready_file_current(self, recorded_modified: str | None, canonical_file_path: pathlib.Path) -> bool:
+        # an earlier version skips the ready file, and may have changed the data item since the close, which changes the
+        # stored modified time of the canonical file. clocks of different machines can't be compared, so the time has to
+        # match the one recorded at the close; a file with no modified time matches one recorded as missing. a ready file
+        # with no readable properties or record never replaces its canonical file. a canonical file whose properties can't
+        # be read is replaced, since the load couldn't use it. a canonical file marked removed discards the ready file, so
+        # that its data item stays removed.
+        if recorded_modified is None:
+            return False
+        canonical_properties = self.__hdf5_handler_factory.read_file_properties(canonical_file_path)
+        if canonical_properties is None:
+            return True
+        return canonical_properties.get("version", 0) == DataItem.DataItem.writer_version and HDF5Handler.get_stored_modified_json(canonical_properties) == recorded_modified
+
+    def __make_storage_handlers(self, absolute_file_paths: typing.AbstractSet[str], ready_file_paths: typing.Mapping[str, tuple[pathlib.Path, str | None]] | None = None) -> typing.Sequence[StorageHandler.StorageHandler]:
+        # make a storage handler for each of the files which is a data file. a canonical file whose ready file refused the
+        # replace at load gets a handler pending on the ready file, so that its data item loads the data saved last, and
+        # the replace is tried again at each pass.
         storage_handlers = list()
         for file_handler_factory in self._file_handler_factories:
             for data_file in filter(file_handler_factory.is_matching, absolute_file_paths):
                 try:
-                    storage_handler = file_handler_factory.make(pathlib.Path(data_file))
+                    storage_handler: StorageHandler.StorageHandler
+                    if ready_file_paths and (ready_file := ready_file_paths.get(data_file)) is not None:
+                        storage_handler = self.__hdf5_handler_factory.make_pending(pathlib.Path(data_file), ready_file[0], ready_file[1])
+                    else:
+                        storage_handler = file_handler_factory.make(pathlib.Path(data_file))
                     assert storage_handler.is_valid
                     storage_handlers.append(storage_handler)
                 except Exception as e:
@@ -1772,8 +1843,10 @@ def make_memory_persistent_storage_system() -> Persistence.PersistentStorageInte
 
 def make_index_project_storage_system(project_path: pathlib.Path, *, large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE,
                                       idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None,
-                                      hdf5_file_locking: bool = True) -> ProjectStorageSystem:
-    return FileProjectStorageSystem(project_path, large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock, hdf5_file_locking=hdf5_file_locking)
+                                      hdf5_file_locking: bool = True, close_replace_timeout: float = DEFAULT_CLOSE_REPLACE_TIMEOUT,
+                                      close_retry_wait: typing.Callable[[float], None] = time.sleep) -> ProjectStorageSystem:
+    return FileProjectStorageSystem(project_path, large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock, hdf5_file_locking=hdf5_file_locking,
+                                    close_replace_timeout=close_replace_timeout, close_retry_wait=close_retry_wait)
 
 
 def make_folder_project_storage_system(project_folder_path: pathlib.Path) -> typing.Optional[ProjectStorageSystem]:
