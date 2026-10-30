@@ -2826,6 +2826,98 @@ class TestStorageClass(unittest.TestCase):
                 self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
             self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
 
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_hdf5_files_whose_locked_item_files_refuse_the_replace_for_the_stuck_delay_are_reported_together_once(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replaces once.
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, clock=lambda: clock_time[0], close_replace_timeout=0.0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_paths = [pathlib.Path(data_item._test_get_file_path()) for data_item in document_model.data_items]
+            document_model = profile_context.create_document_model(auto_close=False)
+            stuck_data_files_list = list[typing.Sequence[tuple[pathlib.Path, DataItem.DataItem | None]]]()
+            stuck_listener = document_model.data_file_replacements_stuck_event.listen(stuck_data_files_list.append)
+            file_locks = [_FileLock(file_path) for file_path in file_paths]
+            try:
+                with document_model.ref():
+                    data_items = list(document_model.data_items)
+                    # the old data is held, so the new data waits in pending files, whose replace the locked item files
+                    # refuse once the holder lets go and the pending files are synced.
+                    data_handles = [data_item.data for data_item in data_items]
+                    for data_item in data_items:
+                        data_item.set_data(replacement)
+                    for file_lock in file_locks:
+                        file_lock.lock()
+                    data_handles.clear()
+                    clock_time[0] += 5.0
+                    document_model.close_released_files()
+                    document_model._project.project_storage_system._wait_for_file_syncs()
+                    document_model.close_released_files()
+                    for _ in range(2):
+                        clock_time[0] += FileStorageSystem.DEFAULT_STUCK_REPLACE_DELAY
+                        document_model.close_released_files()
+                    self.assertEqual([set(zip(file_paths, data_items))], [set(stuck_data_files) for stuck_data_files in stuck_data_files_list])
+                    self.assertTrue(document_model.is_data_file_replacement_pending(file_paths[0]))
+                    # once the unlocked file's replace completes, it is no longer pending.
+                    file_locks[0].unlock()
+                    document_model.close_released_files()
+                    self.assertFalse(document_model.is_data_file_replacement_pending(file_paths[0]))
+            finally:
+                for file_lock in file_locks:
+                    file_lock.unlock()
+            stuck_listener = None
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_stuck_hdf5_files_are_shown_in_one_dialog_at_a_time_without_those_replaced_meanwhile(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5. the close tries the refused replaces once.
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, clock=lambda: clock_time[0], close_replace_timeout=0.0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                for _ in range(3):
+                    document_model.append_data_item(DataItem.DataItem(stored))
+                file_paths = [pathlib.Path(data_item._test_get_file_path()) for data_item in document_model.data_items]
+            document_controller = profile_context.create_document_controller_with_application(auto_close=False)
+            document_model = document_controller.document_model
+            app = typing.cast(Application.Application, document_controller.app)
+            file_locks = [_FileLock(file_path) for file_path in file_paths]
+
+            # the item's new data waits in a pending file, whose replace the locked item's file refuses until it is stuck.
+            def make_stuck(index: int) -> None:
+                document_model.data_items[index].set_data(replacement)
+                file_locks[index].lock()
+                clock_time[0] += 5.0
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
+                document_model.close_released_files()
+                clock_time[0] += FileStorageSystem.DEFAULT_STUCK_REPLACE_DELAY
+                document_model.close_released_files()
+
+            try:
+                with contextlib.closing(document_controller):
+                    # a dialog is a window beside the document window. one shows at a time, and the files reported while
+                    # it is open show once it closes, except those replaced meanwhile.
+                    make_stuck(0)
+                    self.assertEqual(2, len(app.windows))
+                    make_stuck(1)
+                    self.assertEqual(2, len(app.windows))
+                    app.windows[-1].request_close()
+                    self.assertEqual(2, len(app.windows))
+                    make_stuck(2)
+                    file_locks[2].unlock()
+                    document_model.close_released_files()
+                    app.windows[-1].request_close()
+                    self.assertEqual(1, len(app.windows))
+            finally:
+                for file_lock in file_locks:
+                    file_lock.unlock()
+
     def test_copy_of_project_made_while_hdf5_data_is_pending_keeps_a_later_change_to_the_file_and_deletes_the_pending_file(self):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)

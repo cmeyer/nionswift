@@ -454,13 +454,18 @@ class HDF5DeferredFiles:
     own. Close waits between its tries with close_retry_wait, which is given the time in seconds. The time recorded is
     the one given with the pending file, since another program may refuse reads of the canonical file by then. Close
     leaves anything else still refused for the next load.
+
+    A replacement is stuck once the file system has refused it for stuck_replace_delay, by the clock, since the first
+    refusal of its pending file, and take_stuck_replacements returns it once.
     """
 
     def __init__(self, *, sync_delay: float = 0.0, clock: typing.Callable[[], float] = time.monotonic, close_replace_timeout: float = 0.0,
-                 close_retry_wait: typing.Callable[[float], None] = time.sleep, file_locking: bool = True) -> None:
+                 close_retry_wait: typing.Callable[[float], None] = time.sleep, file_locking: bool = True, stuck_replace_delay: float = 0.0) -> None:
         # how long a pending file goes without writes before a pass requests its sync, and the clock which times it.
         self.__sync_delay = sync_delay
         self.__clock = clock
+        # how long, by the clock, the file system refuses the replace of a pending file before it is stuck.
+        self.__stuck_replace_delay = stuck_replace_delay
         # how long close tries the refused replacements again, in seconds of real time, since close waits between tries,
         # and the function which waits.
         self.__close_replace_timeout = close_replace_timeout
@@ -487,6 +492,11 @@ class HDF5DeferredFiles:
         self.__pending_files: dict[pathlib.Path, tuple[pathlib.Path, weakref.ReferenceType[HDF5Handler] | None, str | None]] = dict()
         # the syncs of removed pending files, which move into the trash once synced, by data item uuid. main thread only.
         self.__removed_file_syncs: dict[uuid.UUID, HDF5FileSync] = dict()
+        # the time of the first refused replace of each pending file, by the clock, or None once it is found stuck, so
+        # that it is found stuck once; and the replacements found stuck since the last take, each as its pending file and
+        # its canonical file.
+        self.__refused_replace_times: dict[pathlib.Path, float | None] = dict()
+        self.__stuck_replacements: list[tuple[pathlib.Path, pathlib.Path]] = list()
 
         # the syncs waiting for the sync thread, oldest first and one per file, so that the files bound them; the sync
         # running; and the thread, which the first request starts. the condition protects them, and the thread doesn't
@@ -583,6 +593,11 @@ class HDF5DeferredFiles:
             file_paths.extend(file_path for file_path in deleted_file_paths if file_path.name == canonical_file_name)
         return [file_path for file_path in file_paths if file_path not in self.__unmarked_files and file_path.exists()]
 
+    def is_canonical_file_pending(self, canonical_file_path: pathlib.Path) -> bool:
+        # main thread only. whether a pending file still waits to replace the canonical file.
+        with self.__lock:
+            return any(pending_file[0] == canonical_file_path for pending_file in self.__pending_files.values())
+
     def add_pending_file(self, pending_file_path: pathlib.Path, canonical_file_path: pathlib.Path, handler: HDF5Handler, canonical_modified: str | None) -> None:
         # any thread, under the handler's lock. the handler completes the replacement when it can.
         with self.__lock:
@@ -606,6 +621,7 @@ class HDF5DeferredFiles:
         # still waiting is dropped.
         with self.__lock:
             self.__pending_files.pop(pending_file_path, None)
+            self.__refused_replace_times.pop(pending_file_path, None)
         self.drop_sync(pending_file_path)
 
     def discard_pending_file(self, pending_file_path: pathlib.Path, canonical_file_path: pathlib.Path) -> None:
@@ -614,6 +630,26 @@ class HDF5DeferredFiles:
         self.remove_pending_file(pending_file_path)
         if pending_file_path != get_ready_file_path(canonical_file_path):
             self.delete_file(pending_file_path)
+
+    def record_refused_replace(self, pending_file_path: pathlib.Path, canonical_file_path: pathlib.Path) -> None:
+        # any thread, under the handler's lock. the file system refused the replace of the canonical file by the pending
+        # file. the replace is stuck once it has been refused for the stuck delay.
+        now = self.__clock()
+        with self.__lock:
+            refused_replace_time = self.__refused_replace_times.setdefault(pending_file_path, now)
+            if refused_replace_time is not None and now - refused_replace_time >= self.__stuck_replace_delay:
+                self.__stuck_replacements.append((pending_file_path, canonical_file_path))
+                self.__refused_replace_times[pending_file_path] = None
+
+    def take_stuck_replacements(self) -> typing.Sequence[tuple[pathlib.Path, pathlib.Path]]:
+        """Return the replacements found stuck since the last call, each as its pending file and its canonical file.
+
+        Each replacement is returned once. Main thread only.
+        """
+        with self.__lock:
+            stuck_replacements = self.__stuck_replacements
+            self.__stuck_replacements = list()
+        return stuck_replacements
 
     def request_sync(self, file_path: pathlib.Path) -> HDF5FileSync:
         """Return a sync of the file at file_path on the sync thread, which covers what was written to it before this call.
@@ -726,6 +762,8 @@ class HDF5DeferredFiles:
             self.__removed_files.clear()
             self.__deleted_files.clear()
             self.__pending_files.clear()
+            self.__refused_replace_times.clear()
+            self.__stuck_replacements.clear()
         self.__removed_file_syncs.clear()
         # the handlers have done their syncs. a removed pending file which waits for its sync stays for the next load.
         with self.__sync_condition:
@@ -884,6 +922,7 @@ class HDF5DeferredFiles:
                 try:
                     move_data_file(pending_file_path, canonical_file_path, replace=True)
                 except OSError:
+                    self.record_refused_replace(pending_file_path, canonical_file_path)
                     continue
                 self.remove_pending_file(pending_file_path)
 
@@ -1202,6 +1241,7 @@ class HDF5Handler(StorageHandler.StorageHandler):
         try:
             move_data_file(self.__current_file_path, self.__canonical_file_path, replace=True)
         except OSError:
+            self.__deferred_files.record_refused_replace(self.__current_file_path, self.__canonical_file_path)
             return False
         self.__deferred_files.remove_pending_file(self.__current_file_path)
         self.__current_file_path = self.__canonical_file_path
