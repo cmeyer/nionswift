@@ -60,7 +60,7 @@ DEFAULT_IDLE_FILE_DELAY = 5.0
 
 @dataclasses.dataclass(frozen=True)
 class ProjectStorageSettings:
-    """How a project's file storage chooses where to store data, when it closes idle data files, and whether HDF5 locks the files it has open.
+    """How a project's file storage chooses where to store data, and how it handles its data files.
 
     The settings apply to index projects only, not to legacy folder projects or to the project an upgrade writes.
     """
@@ -69,10 +69,10 @@ class ProjectStorageSettings:
     """The number of bytes above which data is stored in HDF5, and otherwise in ndata."""
 
     idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY
-    """The time, by the clock, after which a data file whose data nobody holds closes."""
+    """The time, by the clock, after which a data file whose data nobody holds closes, and a pending HDF5 file with no writes is synced."""
 
     clock: typing.Callable[[], float] = time.monotonic
-    """The clock which times idle files, returning the current time in seconds."""
+    """The clock which times idle files and the syncs of pending files, returning the current time in seconds."""
 
     hdf5_file_locking: bool = True
     """Whether HDF5 locks the data files it has open, as it does by default."""
@@ -1025,15 +1025,16 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         """Make the storage system of the project at project_path.
 
         Data above large_format_size bytes is stored in HDF5. A data file whose data nobody holds closes once it has
-        been idle for idle_file_delay seconds. The clock returns the current time in seconds, and defaults to
-        time.monotonic. HDF5 locks the files it has open unless hdf5_file_locking is False.
+        been idle for idle_file_delay seconds, and a pending HDF5 file is synced once it has had no writes for as long.
+        The clock returns the current time in seconds, and defaults to time.monotonic. HDF5 locks the files it has open
+        unless hdf5_file_locking is False.
         """
         super().__init__()
         self.__project_path = project_path
         self.__project_data_path = project_data_path
         self.__large_format_size = large_format_size
         # HDF5 files given up while in use, and files waiting to be renamed or deleted, until nothing has them open.
-        self.__hdf5_deferred_files = HDF5Handler.HDF5DeferredFiles(file_locking=hdf5_file_locking)
+        self.__hdf5_deferred_files = HDF5Handler.HDF5DeferredFiles(sync_delay=idle_file_delay, clock=clock or time.monotonic, file_locking=hdf5_file_locking)
         # current HDF5 files whose data nobody holds close here once idle.
         self.__hdf5_idle_files = HDF5Handler.HDF5IdleFiles(delay=idle_file_delay, clock=clock or time.monotonic)
         self.__hdf5_handler_factory = HDF5Handler.HDF5HandlerFactory(self.__hdf5_deferred_files, self.__hdf5_idle_files, file_locking=hdf5_file_locking)
@@ -1050,6 +1051,10 @@ class FileProjectStorageSystem(ProjectStorageSystem):
     def close_released_files(self) -> None:
         self.__hdf5_deferred_files.close_released_files()
         self.__hdf5_idle_files.close_idle_files()
+
+    def _wait_for_file_syncs(self) -> None:
+        # wait until the HDF5 file syncs requested so far have run. for testing.
+        self.__hdf5_deferred_files._wait_for_syncs()
 
     def normalize_project_data_path(self) -> None:
         # in order to be resilient to name changes, first make a list of folders in project_data_folders which
@@ -1127,7 +1132,7 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         return file_handler_factory.make(self.__project_data_path / self.__get_base_path(storage_handler_attributes))
 
     def _find_storage_handlers(self) -> typing.Sequence[StorageHandler.StorageHandler]:
-        return self.__find_storage_handlers(self.__project_data_path)
+        return self.__find_storage_handlers(self.__project_data_path, is_load=True)
 
     def _remove_storage_handler(self, storage_handler: StorageHandler.StorageHandler, *, safe: bool = False) -> None:
         assert self.__project_data_path is not None
@@ -1445,14 +1450,34 @@ class FileProjectStorageSystem(ProjectStorageSystem):
                 return file_handler_factory
         return None
 
-    def __find_storage_handlers(self, directory: typing.Optional[pathlib.Path], *, skip_trash: bool = True) -> typing.Sequence[StorageHandler.StorageHandler]:
+    def __find_storage_handlers(self, directory: pathlib.Path | None, *, skip_trash: bool = True, is_load: bool = False) -> typing.Sequence[StorageHandler.StorageHandler]:
+        # at load, for the data folder, the pending files found are deleted first.
         absolute_file_paths = set()
+        pending_file_paths = list[pathlib.Path]()
         if directory and directory.exists():
             for file_path in directory.rglob("*"):
                 if not skip_trash or file_path.parent.name != "trash":
                     if not file_path.name.startswith("."):
                         absolute_file_paths.add(str(file_path))
+                    elif HDF5Handler.get_canonical_file_path(file_path):
+                        pending_file_paths.append(file_path)
+        if is_load:
+            self.__delete_pending_files(pending_file_paths)
         return self.__make_storage_handlers(absolute_file_paths)
+
+    def __delete_pending_files(self, pending_file_paths: typing.Sequence[pathlib.Path]) -> None:
+        """Delete the pending files which a session left behind, at load, on the main thread.
+
+        The canonical file beside each keeps the data item's previous data and the properties which describe it, since
+        nothing writes it while a file is pending. A file this process has open isn't deleted. A delete which is refused
+        is logged and left, and is tried again at the next load.
+        """
+        for pending_file_path in pending_file_paths:
+            if not HDF5Handler.HDF5FileEntry.is_path_open(pending_file_path):
+                try:
+                    HDF5Handler.move_data_file(pending_file_path, None)
+                except OSError as e:
+                    logging.getLogger("loader").warning(f"Unable to delete pending data file {pending_file_path} ({e}).")
 
     def __make_storage_handlers(self, absolute_file_paths: typing.AbstractSet[str]) -> typing.Sequence[StorageHandler.StorageHandler]:
         # make a storage handler for each of the files which is a data file.

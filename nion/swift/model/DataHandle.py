@@ -13,6 +13,17 @@ import numpy.typing
 _NDArray = numpy.typing.NDArray[typing.Any]
 
 
+class DataHandleWriteGeneration:
+    """The generation of the writes through the data handles which share it, which each write advances.
+
+    Only one handle of a storage handler accepts writes at a time, and it advances the generation under its write lock.
+    Another thread reads the generation without a lock, since reading an int is atomic.
+    """
+
+    def __init__(self) -> None:
+        self.value = 0
+
+
 class DataHandle:
     """A handle to a data item's data stored in a file, standing in for the array.
 
@@ -32,12 +43,14 @@ class DataHandle:
     The handle is the only route to the stored dataset, which it does not expose.
     """
 
-    # the dataset is an h5py dataset, which has no type information.
-    def __init__(self, dataset: typing.Any) -> None:
+    # the dataset is an h5py dataset, which has no type information. the write generation, if given, advances with each
+    # write.
+    def __init__(self, dataset: typing.Any, write_generation: DataHandleWriteGeneration | None = None) -> None:
         self.__dataset = dataset
         # whether the data item's data has been replaced. the write lock orders each write against the mark.
         self.__replaced = False
         self.__write_lock = threading.Lock()
+        self.__write_generation = write_generation
 
     def __repr__(self) -> str:
         return f"<DataHandle {self.shape} {self.dtype}>"
@@ -77,7 +90,12 @@ class DataHandle:
         with self.__write_lock:
             if self.__replaced:
                 raise ValueError("The data item's data was replaced, so the write to its earlier data did not happen.")
-            self.__dataset[key] = value
+            try:
+                self.__dataset[key] = value
+            finally:
+                # a write which raises may have reached the file in part, so it advances the generation too.
+                if self.__write_generation is not None:
+                    self.__write_generation.value += 1
 
     # iterate over the first axis; each item is what indexing returns, a numpy array or a numpy scalar.
     def __iter__(self) -> typing.Iterator[typing.Any]:
