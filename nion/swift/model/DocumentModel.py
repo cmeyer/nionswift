@@ -12,6 +12,7 @@ import functools
 import gettext
 import json
 import logging
+import pathlib
 import pkgutil
 import threading
 import traceback
@@ -576,6 +577,9 @@ class DocumentModel(Observable.Observable, ReferenceCounting.ReferenceCounted, D
 
         self.computation_updated_event = Event.Event()
         self.project_loaded_event = Event.Event()
+        # fired on the main thread by a close_released_files in which data file replacements became stuck, with the data
+        # file and data item, or None, of each.
+        self.data_file_replacements_stuck_event = Event.Event()
 
         self.__computation_thread_pool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
@@ -1910,6 +1914,16 @@ class DocumentModel(Observable.Observable, ReferenceCounting.ReferenceCounted, D
             if isinstance(data_item, DataItem.DataItem):
                 data_item.drop_loaded_data(functools.partial(project_storage_system.complete_pending_file, data_item_uuid))
         project_storage_system.close_released_files()
+        if stuck_replacements := project_storage_system.take_stuck_data_file_replacements():
+            stuck_data_files = list[tuple[pathlib.Path, DataItem.DataItem | None]]()
+            for stuck_replacement in stuck_replacements:
+                data_item = project.get_item_by_uuid("data_items", stuck_replacement.data_item_uuid) if stuck_replacement.data_item_uuid else None
+                stuck_data_files.append((stuck_replacement.file_path, data_item if isinstance(data_item, DataItem.DataItem) else None))
+            self.data_file_replacements_stuck_event.fire(stuck_data_files)
+
+    def is_data_file_replacement_pending(self, file_path: pathlib.Path) -> bool:
+        """Return whether the data file at file_path still waits for its replace by a pending file."""
+        return self._project.project_storage_system.is_data_file_replacement_pending(file_path)
 
     # for testing
     def _get_pending_data_item_updates_count(self) -> int:
