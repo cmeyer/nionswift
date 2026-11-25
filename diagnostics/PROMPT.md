@@ -6,13 +6,14 @@ Report what you find; don't change the branch's code.
 
 ## What the branch is
 
-The diagnostics branch is the data-handle branch plus one commit adding this `diagnostics` folder.
+The diagnostics branch is the data-handle branch plus commits which change only this `diagnostics` folder.
 
 - **The data-handle branch** changes how nionswift stores HDF5 data. A data item hands out a `DataHandle` in place of the
   h5py dataset. An idle file is closed after 5 s and reopened when next used. Data of a new shape, or a reserve, goes to a
   hidden pending file, which is synced and then renamed over the item's file once nobody holds the old data.
 - **Its first commit** adds `performance\hdf5_replace.py` to master. So that commit measures master, and the data-handle
-  tip (`HEAD~1`) measures the branch. `diagnostics\windows_run.ps1` finds both commits itself.
+  tip, the newest commit which changes anything outside `diagnostics`, measures the branch. `diagnostics\windows_run.ps1`
+  finds both commits itself.
 
 ## What is known from other machines
 
@@ -60,6 +61,14 @@ All timings are pinned to processors 0 and 1, medians in ms, master against the 
    ```
    powershell -ExecutionPolicy Bypass -File .\diagnostics\windows_run.ps1 -WorkDir C:\perftemp
    ```
+   The run takes longer than a single command of yours may wait. Start it in the background, for example:
+   ```
+   Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -File .\diagnostics\windows_run.ps1 -WorkDir C:\perftemp" -RedirectStandardOutput test-results-run.log -NoNewWindow
+   ```
+   Then check on it every few minutes, by reading `test-results-run.log` and the files in `test-results\`, until the log
+   prints `results in`. The run switches the clone between two commits. If a run is cut off, `git branch --show-current`
+   prints nothing; run `git switch 2026-11-25-data-handle-diagnostics` before starting again.
+
    Check `test-results\affinity.txt` shows affinity 3 for every python process, and that both test suites pass.
 
 3. **Compare** each row's median between master and the branch, round by round. A row is slower on the branch only if
