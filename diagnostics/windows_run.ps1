@@ -5,7 +5,7 @@
 #     powershell -ExecutionPolicy Bypass -File .\diagnostics\windows_run.ps1 -WorkDir <folder on the drive to measure>
 # Results go into .\test-results. Keep the machine quiet during the timing rounds, which run on processors 0 and 1 only.
 #
-# The diagnostics branch is the data-handle branch plus one commit holding this folder. The data-handle branch's first
+# The diagnostics branch is the data-handle branch plus commits which change only this folder. The data-handle branch's first
 # commit adds performance\hdf5_replace.py to master, so that commit measures master and the data-handle tip measures the
 # branch. The scripts are copied out of the checkout first, since this folder exists only at the diagnostics commit.
 #
@@ -39,7 +39,8 @@ if (git status --short --untracked-files=no) {
     Write-Output "The working tree has changes; commit or stash them first."
     exit 1
 }
-$branchTip = (git rev-parse "HEAD~1").Trim()
+# the data-handle tip is the newest commit which changes anything outside this folder.
+$branchTip = (git log -1 --format=%H HEAD -- . ":(exclude)diagnostics").Trim()
 $first = (git log --diff-filter=A --format=%H $branchTip -- performance/hdf5_replace.py | Select-Object -Last 1).Trim()
 Write-Output "diagnostics at $(git rev-parse --short HEAD), data-handle tip $($branchTip.Substring(0, 8)), master measured at $($first.Substring(0, 8))"
 
