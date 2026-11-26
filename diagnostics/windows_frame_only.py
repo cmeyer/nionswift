@@ -2,6 +2,7 @@
 
 Usage, from the nionswift clone, with PYTHONPATH set to the clone, at each commit to compare:
     python windows_frame_only.py <path to hdf5_replace.py> <label> [--rounds N] [--log <file>] [--no-sync] [--no-idle-close] [--pause SECONDS]
+        [--no-throttling] [--high-performance]
 It opens the script's project with a 64 x 64 image, then for each round makes a new 4D item and writes the frames of its
 scan, as the script's frame_write measurement does, timing each frame with the storage settling after it. It prints the
 median, mean and p90 time of a frame write for each round. The script's frame_write comes after its reshape and rewrite
@@ -17,6 +18,10 @@ keeps idle files open, as master does. Both patch the storage in this process on
 
 With --pause, it sleeps for the given seconds before each round after the first, as the branch's process mostly sleeps
 while the storage settles after a round, to show whether the wait alone slows the next round's frames.
+
+On Windows, --no-throttling opts this process out of power throttling of its execution speed, which ends with the
+process, and --high-performance makes the High performance power plan active for the run and makes the plan which was
+active before it active again at the end. Each shows whether it keeps the frames after a pause at full speed.
 
 For each block of 128 frames and each round, it also reports the median time of a frame spent inside h5py's dataset
 writes, which both versions make for a frame, and the rest of the frame's time apart from it; and the page faults of the
@@ -34,6 +39,7 @@ import statistics
 import sys
 import time
 import typing
+import uuid
 
 BLOCK_FRAMES = 128
 
@@ -63,6 +69,58 @@ def get_memory_counters() -> tuple[int, float, float | None]:
     return usage.ru_minflt + usage.ru_majflt, max_rss, None
 
 
+class Guid(ctypes.Structure):
+    # GUID from guiddef.h.
+    _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16), ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+
+class ProcessPowerThrottlingState(ctypes.Structure):
+    # PROCESS_POWER_THROTTLING_STATE from processthreadsapi.h.
+    _fields_ = [("Version", ctypes.c_uint32), ("ControlMask", ctypes.c_uint32), ("StateMask", ctypes.c_uint32)]
+
+
+# the High performance power plan, SCHEME_MIN.
+HIGH_PERFORMANCE_PLAN = uuid.UUID("8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c")
+
+
+def opt_out_of_power_throttling() -> None:
+    """Opt this process out of power throttling of its execution speed, until it ends."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    # ProcessPowerThrottling is 4 in PROCESS_INFORMATION_CLASS. execution speed (1) in the control mask and not in the
+    # state mask turns its throttling off.
+    state = ProcessPowerThrottlingState(1, 1, 0)
+    if not kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), 4, ctypes.byref(state), ctypes.sizeof(state)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def get_active_power_plan() -> uuid.UUID:
+    """Return the GUID of the active power plan."""
+    powrprof = ctypes.WinDLL("powrprof")
+    kernel32 = ctypes.WinDLL("kernel32")
+    powrprof.PowerGetActiveScheme.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(Guid))]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    plan = ctypes.POINTER(Guid)()
+    result = powrprof.PowerGetActiveScheme(None, ctypes.byref(plan))
+    if result != 0:
+        raise ctypes.WinError(result)
+    try:
+        return uuid.UUID(bytes_le=bytes(plan.contents))
+    finally:
+        kernel32.LocalFree(plan)
+
+
+def set_active_power_plan(plan: uuid.UUID) -> None:
+    """Make the power plan with the given GUID active."""
+    powrprof = ctypes.WinDLL("powrprof")
+    powrprof.PowerSetActiveScheme.argtypes = [ctypes.c_void_p, ctypes.POINTER(Guid)]
+    guid = Guid.from_buffer_copy(plan.bytes_le)
+    result = powrprof.PowerSetActiveScheme(None, ctypes.byref(guid))
+    if result != 0:
+        raise ctypes.WinError(result)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="time only the frame writes of hdf5_replace.py")
     parser.add_argument("script", help="the path to hdf5_replace.py")
@@ -72,7 +130,28 @@ def main() -> None:
     parser.add_argument("--no-sync", action="store_true", help="make each sync of a data file do nothing")
     parser.add_argument("--no-idle-close", action="store_true", help="keep idle data files open")
     parser.add_argument("--pause", type=float, default=0.0, help="the seconds to sleep before each round after the first")
+    parser.add_argument("--no-throttling", action="store_true", help="opt this process out of power throttling, on Windows")
+    parser.add_argument("--high-performance", action="store_true", help="make the High performance power plan active for the run, on Windows")
     options = parser.parse_args()
+    if (options.no_throttling or options.high_performance) and sys.platform != "win32":
+        sys.exit("--no-throttling and --high-performance work only on Windows.")
+    if options.no_throttling:
+        opt_out_of_power_throttling()
+        print(f"{options.label}: power throttling turned off for this process", flush=True)
+    previous_plan = get_active_power_plan() if options.high_performance else None
+    if previous_plan is not None:
+        set_active_power_plan(HIGH_PERFORMANCE_PLAN)
+        print(f"{options.label}: power plan {get_active_power_plan()} active for the run, was {previous_plan}", flush=True)
+    try:
+        run(options)
+    finally:
+        if previous_plan is not None:
+            set_active_power_plan(previous_plan)
+            print(f"{options.label}: power plan {get_active_power_plan()} active again", flush=True)
+
+
+def run(options: argparse.Namespace) -> None:
+    """Run the rounds which options give, and print their results."""
     # the paths are made absolute first, since the script's setup changes the current directory.
     script_path = pathlib.Path(options.script).resolve()
     log_path = pathlib.Path(options.log).resolve() if options.log else None
