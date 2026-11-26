@@ -1,7 +1,7 @@
 """Time only the acquisition frame writes of performance/hdf5_replace.py, with none of its other measurements before them.
 
 Usage, from the nionswift clone, with PYTHONPATH set to the clone, at each commit to compare:
-    python windows_frame_only.py <path to hdf5_replace.py> <label> [--rounds N] [--log <file>] [--no-sync] [--no-idle-close]
+    python windows_frame_only.py <path to hdf5_replace.py> <label> [--rounds N] [--log <file>] [--no-sync] [--no-idle-close] [--pause SECONDS]
 It opens the script's project with a 64 x 64 image, then for each round makes a new 4D item and writes the frames of its
 scan, as the script's frame_write measurement does, timing each frame with the storage settling after it. It prints the
 median, mean and p90 time of a frame write for each round. The script's frame_write comes after its reshape and rewrite
@@ -14,6 +14,9 @@ sync of a data file. On a version without that logger, the file holds only the d
 The data-handle branch syncs each pending file before it replaces the item's file, and closes a file once it has been idle
 for a while. To find which of these slows later frame writes, --no-sync makes each sync do nothing, and --no-idle-close
 keeps idle files open, as master does. Both patch the storage in this process only, and need the data-handle branch.
+
+With --pause, it sleeps for the given seconds before each round after the first, as the branch's process mostly sleeps
+while the storage settles after a round, to show whether the wait alone slows the next round's frames.
 
 For each block of 128 frames and each round, it also reports the median time of a frame spent inside h5py's dataset
 writes, which both versions make for a frame, and the rest of the frame's time apart from it; and the page faults of the
@@ -68,6 +71,7 @@ def main() -> None:
     parser.add_argument("--log", help="the file for the data files log")
     parser.add_argument("--no-sync", action="store_true", help="make each sync of a data file do nothing")
     parser.add_argument("--no-idle-close", action="store_true", help="keep idle data files open")
+    parser.add_argument("--pause", type=float, default=0.0, help="the seconds to sleep before each round after the first")
     options = parser.parse_args()
     # the paths are made absolute first, since the script's setup changes the current directory.
     script_path = pathlib.Path(options.script).resolve()
@@ -135,6 +139,8 @@ def main() -> None:
     try:
         hdf5_replace.open_write_project()
         for round_index in range(options.rounds):
+            if round_index > 0 and options.pause > 0:
+                time.sleep(options.pause)
             hdf5_replace.begin_frames()
             gc.collect()
             driver_logger.debug("round %d frames started", round_index + 1)
