@@ -73,9 +73,10 @@ def memory_usage_resource():
 
 
 def create_temp_profile_context(no_remove: bool = False, *, large_format_size: int = FileStorageSystem.DEFAULT_LARGE_FORMAT_SIZE,
-                                idle_file_delay: float = FileStorageSystem.DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None,
-                                hdf5_file_locking: bool = True) -> TestContext.FileProfileContext:
-    return TestContext.FileProfileContext(pathlib.Path.cwd(), no_remove=no_remove, large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock,
+                                idle_file_delay: float = FileStorageSystem.DEFAULT_IDLE_FILE_DELAY, pending_file_sync_delay: float = FileStorageSystem.DEFAULT_PENDING_FILE_SYNC_DELAY,
+                                clock: typing.Callable[[], float] | None = None, hdf5_file_locking: bool = True) -> TestContext.FileProfileContext:
+    return TestContext.FileProfileContext(pathlib.Path.cwd(), no_remove=no_remove, large_format_size=large_format_size, idle_file_delay=idle_file_delay,
+                                          pending_file_sync_delay=pending_file_sync_delay, clock=clock,
                                           hdf5_file_locking=hdf5_file_locking)
 
 
@@ -1245,7 +1246,8 @@ class TestStorageClass(unittest.TestCase):
     def test_replaced_hdf5_file_closes_when_its_holder_drops_it_and_released_files_are_closed(self):
         stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0) as profile_context:
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -1256,10 +1258,13 @@ class TestStorageClass(unittest.TestCase):
                 data_item.set_data(numpy.ones((4, 6, 5), numpy.float32))
                 self.assertEqual(2, HDF5Handler.HDF5FileEntry._open_count)
                 # the replaced file stays open while it is held, even when released files are closed.
+                clock_time[0] += 5.0
                 document_model.close_released_files()
                 self.assertEqual(2, HDF5Handler.HDF5FileEntry._open_count)
                 data_handle = None
                 # the replaced file closes, and the new file closes as it replaces it.
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual(0, HDF5Handler.HDF5FileEntry._open_count)
                 self.assertTrue(numpy.array_equal(numpy.ones((4, 6, 5), numpy.float32), data_item.data))
@@ -1267,7 +1272,8 @@ class TestStorageClass(unittest.TestCase):
     def test_replaced_hdf5_file_dropped_on_another_thread_closes_on_the_main_thread(self):
         stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0) as profile_context:
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -1282,14 +1288,19 @@ class TestStorageClass(unittest.TestCase):
                 thread.join()
                 self.assertEqual(2, HDF5Handler.HDF5FileEntry._open_count)
                 # the replaced file closes, and the new file closes as it replaces it.
+                clock_time[0] += 5.0
+                document_model.close_released_files()
+                self.assertEqual(1, HDF5Handler.HDF5FileEntry._open_count)
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual(0, HDF5Handler.HDF5FileEntry._open_count)
 
     def test_replaced_hdf5_file_closes_after_its_holder_drops_it_once_the_event_loop_runs_without_a_document_controller(self):
         stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
-        # a large format size of 0 stores any data in HDF5; an idle delay far longer than the test runs the event loop keeps
-        # idle closing from closing a file in its place.
-        with create_temp_profile_context(large_format_size=0, idle_file_delay=600.0) as profile_context:
+        # a large format size of 0 stores any data in HDF5; a clock which only the test advances keeps idle closing from
+        # closing a file in its place.
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -1302,6 +1313,7 @@ class TestStorageClass(unittest.TestCase):
                 # the replaced file stays open while its data is held.
                 self.assertEqual(open_count + 2, HDF5Handler.HDF5FileEntry._open_count)
                 data_handle = None
+                clock_time[0] += 5.0
                 # run the document model's event loop until the replaced file closes, and the new file closes as it
                 # replaces it. the timeout only keeps a failing test from running on.
                 deadline = time.monotonic() + DocumentModel.CLOSE_RELEASED_FILES_INTERVAL + 5.0
@@ -1641,7 +1653,8 @@ class TestStorageClass(unittest.TestCase):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0) as profile_context:
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -1651,6 +1664,9 @@ class TestStorageClass(unittest.TestCase):
                 file_path = pathlib.Path(data_item._test_get_file_path())
                 data_item.set_data(replacement)
                 # the pending file with the new data and properties then replaces the file.
+                clock_time[0] += 5.0
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
                 self.assertTrue(numpy.array_equal(replacement, data_item.data))
@@ -1658,10 +1674,49 @@ class TestStorageClass(unittest.TestCase):
             with document_model.ref():
                 self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
 
+    def test_hdf5_data_reserved_with_new_shape_and_partially_updated_replaces_its_file_once_it_has_had_no_writes_for_the_sync_delay(self):
+        stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
+        frame = DataAndMetadata.new_data_and_metadata(numpy.full((6, 5), 2.0, numpy.float32))
+        data_metadata = DataAndMetadata.DataMetadata(data_shape_and_dtype=((4, 6, 5), numpy.dtype(numpy.float32)), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
+        expected = numpy.full((4, 6, 5), 2.0, numpy.float32)
+        clock_time = [100.0]
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0, pending_file_sync_delay=2.0, clock=lambda: clock_time[0]) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                # the reserve goes to a pending file, which takes a frame a second, as an acquisition writes them.
+                data_item.reserve_data(data_shape=(4, 6, 5), data_dtype=numpy.dtype(numpy.float32), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
+                for index in range(4):
+                    clock_time[0] += 1.0
+                    data_item.set_data_and_metadata_partial(data_metadata, frame, (slice(None), slice(None)), (slice(index, index + 1), slice(None), slice(None)))
+                    document_model.close_released_files()
+                    document_model._project.project_storage_system._wait_for_file_syncs()
+                # the pending file stays until it has had no writes for the sync delay since the last frame.
+                clock_time[0] += 1.9
+                for index in range(3):
+                    document_model.close_released_files()
+                    document_model._project.project_storage_system._wait_for_file_syncs()
+                with h5py.File(file_path, "r") as f:
+                    self.assertEqual((3, 5, 7), f["data"].shape)
+                clock_time[0] += 0.1
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
+                document_model.close_released_files()
+                self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(expected, document_model.data_items[0].data))
+
     def test_hdf5_data_reserved_over_existing_data_while_unheld_leaves_only_its_file_with_the_new_data(self):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0) as profile_context:
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -1671,6 +1726,9 @@ class TestStorageClass(unittest.TestCase):
                 file_path = pathlib.Path(data_item._test_get_file_path())
                 data_item.reserve_data(data_shape=(4, 6, 5), data_dtype=numpy.dtype(numpy.float32), data_descriptor=DataAndMetadata.DataDescriptor(False, 1, 2))
                 # the pending file with the reserved data and properties then replaces the file.
+                clock_time[0] += 5.0
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
                 self.assertTrue(numpy.array_equal(numpy.zeros((4, 6, 5), numpy.float32), data_item.data))
@@ -1682,7 +1740,8 @@ class TestStorageClass(unittest.TestCase):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0) as profile_context:
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -1699,6 +1758,9 @@ class TestStorageClass(unittest.TestCase):
                 self.assertTrue(numpy.array_equal(replacement, data_item.data))
                 # once the holder lets go, the pending file replaces the file.
                 data_handle = None
+                clock_time[0] += 5.0
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
                 self.assertTrue(numpy.array_equal(replacement, data_item.data))
@@ -1710,7 +1772,8 @@ class TestStorageClass(unittest.TestCase):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0) as profile_context:
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -1728,6 +1791,9 @@ class TestStorageClass(unittest.TestCase):
                     self.assertEqual((3, 5, 7), f["data"].shape)
                 self.assertTrue(numpy.array_equal(replacement, numpy.asarray(new_data_handle)))
                 new_data_handle = None
+                clock_time[0] += 5.0
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
                 self.assertTrue(numpy.array_equal(replacement, data_item.data))
@@ -1786,7 +1852,8 @@ class TestStorageClass(unittest.TestCase):
     def test_hdf5_data_reserved_in_a_transaction_while_unheld_keeps_the_previous_data_and_properties_in_its_file_until_the_transaction_ends(self):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False) as profile_context:
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.new_data_item(DataAndMetadata.new_data_and_metadata(stored, metadata={"generation": 1})))
@@ -1807,6 +1874,9 @@ class TestStorageClass(unittest.TestCase):
                 self.assertEqual([3, 5, 7], properties["data_shape"])
                 self.assertEqual({"generation": 1}, properties["metadata"])
                 # once the transaction ends, the reserved data and its properties replace the file.
+                clock_time[0] += 5.0
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
                 with h5py.File(file_path, "r", locking=False) as f:
@@ -1892,7 +1962,8 @@ class TestStorageClass(unittest.TestCase):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         replacements = [numpy.random.default_rng(59 + index).random((4 + index, 6, 5)).astype(numpy.float32) for index in range(3)]
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0) as profile_context:
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -1906,6 +1977,9 @@ class TestStorageClass(unittest.TestCase):
                 data_item.set_data(replacements[1])
                 # the second pending file is not held, so a later pass deletes it; the first is held and stays.
                 data_item.set_data(replacements[2])
+                clock_time[0] += 5.0
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertTrue(numpy.array_equal(replacements[0], numpy.asarray(first_data_handle)))
                 self.assertTrue(numpy.array_equal(replacements[2], data_item.data))
@@ -1953,6 +2027,7 @@ class TestStorageClass(unittest.TestCase):
                     file_lock.unlock()
                 clock_time[0] += 5.0
                 document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
             document_model = profile_context.create_document_model(auto_close=False)
@@ -2010,12 +2085,263 @@ class TestStorageClass(unittest.TestCase):
             with document_model.ref():
                 self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
 
+    def test_copy_of_project_made_after_hdf5_data_is_reshaped_while_held_and_before_the_next_pass_loads_data_with_its_properties(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.new_data_item(DataAndMetadata.new_data_and_metadata(stored, metadata={"generation": 1})))
+            document_model = profile_context.create_document_model(auto_close=False)
+            profile = typing.cast(Profile.Profile, document_model._profile_for_test)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                # the old data is held, so the new data and its properties wait in a pending file. copy the project before
+                # the next pass, as a crash would leave it.
+                data_handle = data_item.data
+                data_item.set_xdata(DataAndMetadata.new_data_and_metadata(replacement, metadata={"generation": 2}))
+                shutil.copy(profile_context.projects_dir / "Project.nsproj", profile_context.projects_dir / "Crash.nsproj")
+                shutil.copytree(profile_context.projects_dir / "Project Data", profile_context.projects_dir / "Crash Data")
+                data_handle = None
+            # the copy loads the data of one of the changes with the properties which describe it, and keeps one file.
+            crash_file_path = profile_context.projects_dir / "Crash Data" / file_path.relative_to(profile_context.projects_dir / "Project Data")
+            project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
+            profile.read_project(project_reference)
+            crash_data_item = project_reference.document_model.data_items[0]
+            generation_data = {1: stored, 2: replacement}[crash_data_item.metadata["generation"]]
+            self.assertTrue(numpy.array_equal(generation_data, crash_data_item.data))
+            self.assertEqual(generation_data.shape, crash_data_item.data_shape)
+            self.assertEqual([crash_file_path.name], sorted(path.name for path in crash_file_path.parent.iterdir()))
+
+    def test_copy_of_project_made_after_undoing_the_removal_of_hdf5_data_item_reshaped_while_its_old_file_is_held_loads_data_with_its_properties(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False, clock=lambda: clock_time[0]) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.new_data_item(DataAndMetadata.new_data_and_metadata(stored, metadata={"generation": 1})))
+            document_model = profile_context.create_document_model(auto_close=False)
+            profile = typing.cast(Profile.Profile, document_model._profile_for_test)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                # the new data names this session, in which the restore puts the file. it is the session of the old file,
+                # so that the restore finds the old file where the new data goes.
+                document_model.session_id = file_path.parent.name
+                # the old data is held, so the new data waits in a pending file. the item is removed and restored before
+                # the next pass, and the project is copied after the pass which follows its sync, as a crash would leave
+                # it.
+                data_handle = data_item.data
+                data_item.set_xdata(DataAndMetadata.new_data_and_metadata(replacement, metadata={"generation": 2}))
+                undelete_log = document_model.remove_data_item_with_log(data_item)
+                document_model.undelete_all(undelete_log)
+                undelete_log.close()
+                clock_time[0] += 5.0
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
+                document_model.close_released_files()
+                shutil.copy(profile_context.projects_dir / "Project.nsproj", profile_context.projects_dir / "Crash.nsproj")
+                shutil.copytree(profile_context.projects_dir / "Project Data", profile_context.projects_dir / "Crash Data")
+                data_handle = None
+            # the copy loads the restored item with the data of one of the changes and the properties which describe it, at
+            # its own file.
+            crash_file_path = profile_context.projects_dir / "Crash Data" / file_path.relative_to(profile_context.projects_dir / "Project Data")
+            project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
+            profile.read_project(project_reference)
+            crash_data_items = project_reference.document_model.data_items
+            self.assertEqual(1, len(crash_data_items))
+            generation_data = {1: stored, 2: replacement}
+            self.assertTrue(numpy.array_equal(generation_data[crash_data_items[0].metadata["generation"]], crash_data_items[0].data))
+            self.assertEqual([crash_file_path.name], sorted(path.name for path in crash_file_path.parent.iterdir()))
+
+    @unittest.skipIf(sys.platform == "win32", "Windows doesn't make a folder read-only with chmod.")
+    def test_project_closed_while_the_folder_refuses_the_replace_of_hdf5_data_reshaped_while_held_loads_the_old_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.new_data_item(DataAndMetadata.new_data_and_metadata(stored, metadata={"generation": 1})))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            try:
+                with document_model.ref():
+                    data_item = document_model.data_items[0]
+                    # the old data is held, so the new data waits in a pending file until the project closes, when the
+                    # folder refuses the replace.
+                    data_handle = data_item.data
+                    data_item.set_xdata(DataAndMetadata.new_data_and_metadata(replacement, metadata={"generation": 2}))
+                    file_path.parent.chmod(0o555)
+                # the old data stays held until the project has closed.
+                data_handle = None
+            finally:
+                file_path.parent.chmod(0o755)
+            # the next load deletes the pending file and loads the old data.
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+                self.assertEqual({"generation": 1}, document_model.data_items[0].metadata)
+            self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
+
+    def test_copy_of_project_made_while_hdf5_data_is_pending_keeps_a_later_change_to_the_file_and_deletes_the_pending_file(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            profile = typing.cast(Profile.Profile, document_model._profile_for_test)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                data_handle = data_item.data
+                data_item.set_data(replacement)
+                # copy the project while the replacement is pending, as a crash would leave it.
+                shutil.copy(profile_context.projects_dir / "Project.nsproj", profile_context.projects_dir / "Crash.nsproj")
+                shutil.copytree(profile_context.projects_dir / "Project Data", profile_context.projects_dir / "Crash Data")
+                data_handle = None
+            crash_file_path = profile_context.projects_dir / "Crash Data" / file_path.relative_to(profile_context.projects_dir / "Project Data")
+            pending_file_path = next(path for path in crash_file_path.parent.iterdir() if path.name.startswith("."))
+            # a second project, standing in for an earlier version which ignores hidden files, changes the item's file.
+            aside_file_path = profile_context.workspace_dir / pending_file_path.name
+            shutil.move(pending_file_path, aside_file_path)
+            project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
+            profile.read_project(project_reference)
+            document_model = project_reference.document_model
+            self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+            document_model.data_items[0].title = "changed"
+            project_reference.unload_project()
+            shutil.move(aside_file_path, pending_file_path)
+            # the change is kept and the pending file is deleted.
+            profile.read_project(project_reference)
+            document_model = project_reference.document_model
+            self.assertEqual("changed", document_model.data_items[0].title)
+            self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+            self.assertEqual([crash_file_path.name], sorted(path.name for path in crash_file_path.parent.iterdir()))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its delete is refused.")
+    def test_copy_of_project_made_while_hdf5_data_is_pending_loads_while_another_program_holds_the_pending_file_and_deletes_it_at_a_later_load(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.new_data_item(DataAndMetadata.new_data_and_metadata(stored, metadata={"generation": 1})))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_model = profile_context.create_document_model(auto_close=False)
+            profile = typing.cast(Profile.Profile, document_model._profile_for_test)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                # the old data is held, so the new data waits in a pending file. copy the project meanwhile, as a crash
+                # would leave it.
+                data_handle = data_item.data
+                data_item.set_xdata(DataAndMetadata.new_data_and_metadata(replacement, metadata={"generation": 2}))
+                shutil.copy(profile_context.projects_dir / "Project.nsproj", profile_context.projects_dir / "Crash.nsproj")
+                shutil.copytree(profile_context.projects_dir / "Project Data", profile_context.projects_dir / "Crash Data")
+                data_handle = None
+            crash_file_path = profile_context.projects_dir / "Crash Data" / file_path.relative_to(profile_context.projects_dir / "Project Data")
+            # another program holds the pending file at the first load, which refuses its delete. each load has the data
+            # of one of the changes with the properties which describe it.
+            file_lock = _FileLock(next(crash_file_path.parent.glob(".*.h5")))
+            file_lock.lock()
+            try:
+                project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
+                profile.read_project(project_reference)
+                crash_data_item = project_reference.document_model.data_items[0]
+                self.assertTrue(numpy.array_equal({1: stored, 2: replacement}[crash_data_item.metadata["generation"]], crash_data_item.data))
+                project_reference.unload_project()
+            finally:
+                file_lock.unlock()
+            profile.read_project(project_reference)
+            crash_data_item = project_reference.document_model.data_items[0]
+            self.assertTrue(numpy.array_equal({1: stored, 2: replacement}[crash_data_item.metadata["generation"]], crash_data_item.data))
+            self.assertEqual([crash_file_path.name], sorted(path.name for path in crash_file_path.parent.iterdir()))
+
+    def test_copy_of_project_made_while_hdf5_data_is_reserved_with_its_shape_in_a_transaction_loads_the_old_data(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.new_data_item(DataAndMetadata.new_data_and_metadata(stored, metadata={"generation": 1})))
+            document_model = profile_context.create_document_model(auto_close=False)
+            profile = typing.cast(Profile.Profile, document_model._profile_for_test)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                with document_model.item_transaction(data_item):
+                    # the reserve of the same shape and dtype writes a pending file at once, with a copy of the file's
+                    # properties until the transaction ends. copy the project meanwhile, as a crash would leave it.
+                    data_item.reserve_data(data_shape=(3, 5, 7), data_dtype=numpy.dtype(numpy.float32), data_descriptor=DataAndMetadata.DataDescriptor(False, 1, 2))
+                    shutil.copy(profile_context.projects_dir / "Project.nsproj", profile_context.projects_dir / "Crash.nsproj")
+                    shutil.copytree(profile_context.projects_dir / "Project Data", profile_context.projects_dir / "Crash Data")
+            # the copy loads the old data with its properties.
+            project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
+            profile.read_project(project_reference)
+            document_model = project_reference.document_model
+            self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+            self.assertEqual({"generation": 1}, document_model.data_items[0].metadata)
+
+    def test_pending_hdf5_file_whose_item_file_is_gone_is_deleted_at_load(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+            document_model = profile_context.create_document_model(auto_close=False)
+            profile = typing.cast(Profile.Profile, document_model._profile_for_test)
+            with document_model.ref():
+                data_item = document_model.data_items[0]
+                file_path = pathlib.Path(data_item._test_get_file_path())
+                data_handle = data_item.data
+                data_item.set_data(replacement)
+                # copy the project while the replacement is pending, as a crash would leave it.
+                shutil.copy(profile_context.projects_dir / "Project.nsproj", profile_context.projects_dir / "Crash.nsproj")
+                shutil.copytree(profile_context.projects_dir / "Project Data", profile_context.projects_dir / "Crash Data")
+                data_handle = None
+            crash_file_path = profile_context.projects_dir / "Crash Data" / file_path.relative_to(profile_context.projects_dir / "Project Data")
+            # the item's file goes into the trash, as an earlier version which removes the item does.
+            crash_trash_dir = profile_context.projects_dir / "Crash Data" / "trash"
+            crash_trash_dir.mkdir()
+            shutil.move(crash_file_path, crash_trash_dir / crash_file_path.name)
+            project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
+            profile.read_project(project_reference)
+            self.assertEqual(0, len(project_reference.document_model.data_items))
+            self.assertEqual([], list(crash_file_path.parent.iterdir()))
+
+    def test_hidden_files_beside_an_hdf5_data_file_which_are_not_pending_files_stay_at_load(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            # files of the system and of other programs, whose names start as a pending file's does.
+            other_file_paths = [file_path.with_name(name) for name in (".DS_Store", "._" + file_path.name, "." + file_path.stem + ".notes.h5")]
+            for other_file_path in other_file_paths:
+                other_file_path.write_bytes(bytes(8))
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                self.assertTrue(numpy.array_equal(stored, document_model.data_items[0].data))
+            self.assertEqual(sorted(path.name for path in [file_path] + other_file_paths), sorted(path.name for path in file_path.parent.iterdir()))
+
     @unittest.skipIf(sys.platform == "win32", "Windows doesn't make a folder read-only with chmod.")
     def test_hdf5_data_reshaped_while_held_stays_in_its_pending_file_while_the_folder_refuses_the_replace_and_replaces_the_file_once_it_takes_it(self):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0) as profile_context:
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -2029,6 +2355,9 @@ class TestStorageClass(unittest.TestCase):
                 try:
                     # the holder lets go, but the folder refuses the replace, so the new data stays in the pending file.
                     data_handle = None
+                    clock_time[0] += 5.0
+                    document_model.close_released_files()
+                    document_model._project.project_storage_system._wait_for_file_syncs()
                     document_model.close_released_files()
                     with h5py.File(file_path, "r") as f:
                         self.assertEqual((3, 5, 7), f["data"].shape)
@@ -2047,7 +2376,8 @@ class TestStorageClass(unittest.TestCase):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False) as profile_context:
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -2064,6 +2394,9 @@ class TestStorageClass(unittest.TestCase):
                 data_item.set_data(replacement)
                 undelete_log = document_model.remove_data_item_with_log(data_item)
                 # the old file stays for its holder, marked removed; the new data goes into the trash.
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
+                document_model.close_released_files()
                 self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
                 with h5py.File(file_path, "r", locking=False) as f:
                     self.assertEqual(HDF5Handler.REMOVED_FILE_VERSION, json.loads(f["data"].attrs["properties"])["version"])
@@ -2080,6 +2413,9 @@ class TestStorageClass(unittest.TestCase):
                 self.assertEqual([], list(trash_dir.iterdir()))
                 self.assertTrue(numpy.array_equal(stored, numpy.asarray(data_handle)))
                 data_handle = None
+                clock_time[0] += 5.0
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
                 self.assertTrue(numpy.array_equal(replacement, data_item.data))
@@ -2098,7 +2434,8 @@ class TestStorageClass(unittest.TestCase):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
         replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False) as profile_context:
+        clock_time = [100.0]
+        with create_temp_profile_context(large_format_size=0, hdf5_file_locking=False, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -2130,6 +2467,9 @@ class TestStorageClass(unittest.TestCase):
                 self.assertTrue(numpy.array_equal(replacement, data_item.data))
                 self.assertTrue(numpy.array_equal(replacement, numpy.asarray(new_data_handle)))
                 new_data_handle = None
+                clock_time[0] += 5.0
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual([file_path.name], sorted(path.name for path in file_path.parent.iterdir()))
                 self.assertTrue(numpy.array_equal(replacement, data_item.data))
@@ -2142,6 +2482,7 @@ class TestStorageClass(unittest.TestCase):
             project_reference = profile.open_project(profile_context.projects_dir / "Crash.nsproj")
             profile.read_project(project_reference)
             self.assertEqual(0, len(project_reference.document_model.data_items))
+            self.assertEqual([], list(crash_file_path.parent.iterdir()))
 
     def test_hdf5_data_item_removed_while_its_new_data_is_pending_and_held_leaves_only_the_new_data_in_the_trash_once_let_go(self):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
@@ -2164,6 +2505,8 @@ class TestStorageClass(unittest.TestCase):
                 document_model.remove_data_item(data_item)
                 # once the new data is let go, its pending file moves into the trash and the old file goes.
                 new_data_handle = None
+                document_model.close_released_files()
+                document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual([], list(file_path.parent.iterdir()))
                 self.assertEqual([file_path.name], sorted(path.name for path in trash_dir.iterdir()))
@@ -2700,6 +3043,40 @@ class TestStorageClass(unittest.TestCase):
             with document_model.ref():
                 self.assertEqual(1, len(document_model.display_items))
                 self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+
+    @unittest.skipUnless(_CAN_LOCK_FILE, "Only macOS, BSD and Windows can lock a file so that its replace is refused.")
+    def test_undo_of_removal_refused_after_the_new_data_moved_into_the_trash_restores_it_at_a_later_undo(self):
+        stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)
+        replacement = numpy.random.default_rng(59).random((4, 6, 5)).astype(numpy.float32)
+        # a large format size of 0 stores any data in HDF5.
+        with create_temp_profile_context(large_format_size=0) as profile_context:
+            document_model = profile_context.create_document_model(auto_close=False)
+            with document_model.ref():
+                document_model.append_data_item(DataItem.DataItem(stored))
+                file_path = pathlib.Path(document_model.data_items[0]._test_get_file_path())
+            document_controller = profile_context.create_document_controller(auto_close=False)
+            document_model = document_controller.document_model
+            file_lock = _FileLock(file_path, refuses_reads=True)
+            try:
+                with contextlib.closing(document_controller):
+                    document_model.data_items[0].set_data(replacement)
+                    # the undo of the display item's removal restores its display item first and its data item last.
+                    command = document_controller.create_remove_display_items_command(list(document_model.display_items))
+                    command.perform()
+                    document_controller.push_undo_command(command)
+                    # the lock refuses the delete of the item's file once the new data has moved into the trash.
+                    file_lock.lock()
+                    document_model.close_released_files()
+                    document_model._project.project_storage_system._wait_for_file_syncs()
+                    document_model.close_released_files()
+                    document_controller.handle_undo()
+                    self.assertEqual((0, 0), (len(document_model.data_items), len(document_model.display_items)))
+                    file_lock.unlock()
+                    document_controller.handle_undo()
+                    self.assertEqual(document_model.data_items[0], document_model.display_items[0].data_item)
+                    self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
+            finally:
+                file_lock.unlock()
 
     def test_hdf5_file_of_data_which_moves_to_ndata_while_held_is_deleted_only_after_the_holder_lets_go(self):
         stored = numpy.random.default_rng(58).random((3, 5, 7)).astype(numpy.float32)

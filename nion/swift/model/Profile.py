@@ -261,7 +261,8 @@ class IndexProjectReference(ProjectReference):
         project_path = self.project_path
         if project_path:
             settings = project_storage_settings or FileStorageSystem.ProjectStorageSettings()
-            return FileStorageSystem.make_index_project_storage_system(project_path, large_format_size=settings.large_format_size, idle_file_delay=settings.idle_file_delay, clock=settings.clock,
+            return FileStorageSystem.make_index_project_storage_system(project_path, large_format_size=settings.large_format_size, idle_file_delay=settings.idle_file_delay,
+                                                                       pending_file_sync_delay=settings.pending_file_sync_delay, clock=settings.clock,
                                                                        hdf5_file_locking=settings.hdf5_file_locking)
         return None
 
