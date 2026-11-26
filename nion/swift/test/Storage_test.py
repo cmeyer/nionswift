@@ -73,10 +73,12 @@ def memory_usage_resource():
 
 
 def create_temp_profile_context(no_remove: bool = False, *, large_format_size: int = FileStorageSystem.DEFAULT_LARGE_FORMAT_SIZE,
-                                idle_file_delay: float = FileStorageSystem.DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None,
-                                hdf5_file_locking: bool = True, close_replace_timeout: float = FileStorageSystem.DEFAULT_CLOSE_REPLACE_TIMEOUT,
+                                idle_file_delay: float = FileStorageSystem.DEFAULT_IDLE_FILE_DELAY, pending_file_sync_delay: float = FileStorageSystem.DEFAULT_PENDING_FILE_SYNC_DELAY,
+                                clock: typing.Callable[[], float] | None = None, hdf5_file_locking: bool = True,
+                                close_replace_timeout: float = FileStorageSystem.DEFAULT_CLOSE_REPLACE_TIMEOUT,
                                 close_retry_wait: typing.Callable[[float], None] = time.sleep) -> TestContext.FileProfileContext:
-    return TestContext.FileProfileContext(pathlib.Path.cwd(), no_remove=no_remove, large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock,
+    return TestContext.FileProfileContext(pathlib.Path.cwd(), no_remove=no_remove, large_format_size=large_format_size, idle_file_delay=idle_file_delay,
+                                          pending_file_sync_delay=pending_file_sync_delay, clock=clock,
                                           hdf5_file_locking=hdf5_file_locking, close_replace_timeout=close_replace_timeout, close_retry_wait=close_retry_wait)
 
 
@@ -1695,14 +1697,14 @@ class TestStorageClass(unittest.TestCase):
             with document_model.ref():
                 self.assertTrue(numpy.array_equal(replacement, document_model.data_items[0].data))
 
-    def test_hdf5_data_reserved_with_new_shape_and_partially_updated_replaces_its_file_once_it_has_had_no_writes_for_the_idle_delay(self):
+    def test_hdf5_data_reserved_with_new_shape_and_partially_updated_replaces_its_file_once_it_has_had_no_writes_for_the_sync_delay(self):
         stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
         frame = DataAndMetadata.new_data_and_metadata(numpy.full((6, 5), 2.0, numpy.float32))
         data_metadata = DataAndMetadata.DataMetadata(data_shape_and_dtype=((4, 6, 5), numpy.dtype(numpy.float32)), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
         expected = numpy.full((4, 6, 5), 2.0, numpy.float32)
         clock_time = [100.0]
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0, idle_file_delay=5.0, clock=lambda: clock_time[0]) as profile_context:
+        with create_temp_profile_context(large_format_size=0, idle_file_delay=5.0, pending_file_sync_delay=2.0, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -1717,8 +1719,8 @@ class TestStorageClass(unittest.TestCase):
                     data_item.set_data_and_metadata_partial(data_metadata, frame, (slice(None), slice(None)), (slice(index, index + 1), slice(None), slice(None)))
                     document_model.close_released_files()
                     document_model._project.project_storage_system._wait_for_file_syncs()
-                # the pending file stays until it has had no writes for the idle delay since the last frame.
-                clock_time[0] += 4.9
+                # the pending file stays until it has had no writes for the sync delay since the last frame.
+                clock_time[0] += 1.9
                 for index in range(3):
                     document_model.close_released_files()
                     document_model._project.project_storage_system._wait_for_file_syncs()
@@ -1733,13 +1735,13 @@ class TestStorageClass(unittest.TestCase):
             with document_model.ref():
                 self.assertTrue(numpy.array_equal(expected, document_model.data_items[0].data))
 
-    def test_displayed_hdf5_data_reserved_with_new_shape_and_partially_updated_replaces_its_file_once_it_has_had_no_writes_for_the_idle_delay(self):
+    def test_displayed_hdf5_data_reserved_with_new_shape_and_partially_updated_replaces_its_file_once_it_has_had_no_writes_for_the_sync_delay(self):
         stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)
         data_metadata = DataAndMetadata.DataMetadata(data_shape_and_dtype=((4, 6, 5), numpy.dtype(numpy.float32)), data_descriptor=DataAndMetadata.DataDescriptor(True, 0, 2))
         expected = numpy.stack([numpy.full((6, 5), index + 1.0, numpy.float32) for index in range(4)])
         clock_time = [100.0]
         # a large format size of 0 stores any data in HDF5.
-        with create_temp_profile_context(large_format_size=0, idle_file_delay=5.0, clock=lambda: clock_time[0]) as profile_context:
+        with create_temp_profile_context(large_format_size=0, idle_file_delay=5.0, pending_file_sync_delay=2.0, clock=lambda: clock_time[0]) as profile_context:
             document_model = profile_context.create_document_model(auto_close=False)
             with document_model.ref():
                 document_model.append_data_item(DataItem.DataItem(stored))
@@ -1757,9 +1759,9 @@ class TestStorageClass(unittest.TestCase):
                     data_item.set_data_and_metadata_partial(data_metadata, frame, (slice(None), slice(None)), (slice(index, index + 1), slice(None), slice(None)))
                     document_model.close_released_files()
                     document_model._project.project_storage_system._wait_for_file_syncs()
-                # once the idle delay passes after the last frame, a pass requests the sync, and the next replaces the
+                # once the sync delay passes after the last frame, a pass requests the sync, and the next replaces the
                 # item's file while the item is still displayed.
-                clock_time[0] += 5.0
+                clock_time[0] += 2.0
                 document_model.close_released_files()
                 document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
@@ -1785,7 +1787,7 @@ class TestStorageClass(unittest.TestCase):
             with document_model.ref():
                 data_item = document_model.data_items[0]
                 # the reserve and its properties go to a pending file. an acquisition writes frames into it in a
-                # transaction, which pauses for longer than the idle delay after the first.
+                # transaction, which pauses for longer than the sync delay after the first.
                 data_item.reserve_data(data_shape=(4, 6, 5), data_dtype=numpy.dtype(numpy.float32), data_descriptor=DataAndMetadata.DataDescriptor(False, 1, 2))
                 with document_model.item_transaction(data_item):
                     data_item.set_data_and_metadata_partial(data_metadata, frame, (slice(None), slice(None)), (slice(0, 1), slice(None), slice(None)), update_metadata=True)

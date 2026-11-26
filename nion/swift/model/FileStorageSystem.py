@@ -58,6 +58,10 @@ DEFAULT_LARGE_FORMAT_SIZE = 16 * 1024 * 1024
 # a data file whose data nobody holds closes once it has been idle for this many seconds.
 DEFAULT_IDLE_FILE_DELAY = 5.0
 
+# a pending HDF5 file is synced once it has had no writes for this many seconds, so that a file written continually, as
+# a computation's result through a drag which resizes it, isn't synced after every write.
+DEFAULT_PENDING_FILE_SYNC_DELAY = 2.0
+
 # closing a project tries the refused replaces of HDF5 files by their pending files again for this many seconds in all.
 DEFAULT_CLOSE_REPLACE_TIMEOUT = 2.0
 
@@ -76,7 +80,10 @@ class ProjectStorageSettings:
     """The number of bytes above which data is stored in HDF5, and otherwise in ndata."""
 
     idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY
-    """The time, by the clock, after which a data file whose data nobody holds closes, and a pending HDF5 file with no writes is synced."""
+    """The time, by the clock, after which a data file whose data nobody holds closes."""
+
+    pending_file_sync_delay: float = DEFAULT_PENDING_FILE_SYNC_DELAY
+    """The time, by the clock, after which a pending HDF5 file with no writes is synced."""
 
     clock: typing.Callable[[], float] = time.monotonic
     """The clock which times idle files and the syncs of pending files, returning the current time in seconds."""
@@ -1069,13 +1076,15 @@ class FileProjectStorageSystem(ProjectStorageSystem):
     _file_handler_factories: typing.List[StorageHandler.StorageHandlerFactoryLike] = [NDataHandler.NDataHandlerFactory(), HDF5Handler.HDF5HandlerFactory()]
 
     def __init__(self, project_path: pathlib.Path, project_data_path: pathlib.Path | None = None, *,
-                 large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE, idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None,
+                 large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE, idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY,
+                 pending_file_sync_delay: float = DEFAULT_PENDING_FILE_SYNC_DELAY, clock: typing.Callable[[], float] | None = None,
                  hdf5_file_locking: bool = True, close_replace_timeout: float = DEFAULT_CLOSE_REPLACE_TIMEOUT,
                  close_retry_wait: typing.Callable[[float], None] = time.sleep, stuck_replace_delay: float = DEFAULT_STUCK_REPLACE_DELAY) -> None:
         """Make the storage system of the project at project_path.
 
         Data above large_format_size bytes is stored in HDF5. A data file whose data nobody holds closes once it has
-        been idle for idle_file_delay seconds, and a pending HDF5 file is synced once it has had no writes for as long.
+        been idle for idle_file_delay seconds, and a pending HDF5 file is synced once it has had no writes for
+        pending_file_sync_delay seconds.
         The clock returns the current time in seconds, and defaults to time.monotonic. HDF5 locks the files it has open
         unless hdf5_file_locking is False. Closing the project tries the refused replaces of HDF5 files by their pending
         files again for close_replace_timeout seconds, waiting between tries with close_retry_wait. A replace which the file
@@ -1086,7 +1095,7 @@ class FileProjectStorageSystem(ProjectStorageSystem):
         self.__project_data_path = project_data_path
         self.__large_format_size = large_format_size
         # HDF5 files given up while in use, and files waiting to be renamed or deleted, until nothing has them open.
-        self.__hdf5_deferred_files = HDF5Handler.HDF5DeferredFiles(sync_delay=idle_file_delay, clock=clock or time.monotonic, close_replace_timeout=close_replace_timeout,
+        self.__hdf5_deferred_files = HDF5Handler.HDF5DeferredFiles(sync_delay=pending_file_sync_delay, clock=clock or time.monotonic, close_replace_timeout=close_replace_timeout,
                                                                   close_retry_wait=close_retry_wait, file_locking=hdf5_file_locking, stuck_replace_delay=stuck_replace_delay)
         # current HDF5 files whose data nobody holds close here once idle.
         self.__hdf5_idle_files = HDF5Handler.HDF5IdleFiles(delay=idle_file_delay, clock=clock or time.monotonic)
@@ -1913,10 +1922,11 @@ def make_memory_persistent_storage_system() -> Persistence.PersistentStorageInte
 
 
 def make_index_project_storage_system(project_path: pathlib.Path, *, large_format_size: int = DEFAULT_LARGE_FORMAT_SIZE,
-                                      idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY, clock: typing.Callable[[], float] | None = None,
-                                      hdf5_file_locking: bool = True, close_replace_timeout: float = DEFAULT_CLOSE_REPLACE_TIMEOUT,
+                                      idle_file_delay: float = DEFAULT_IDLE_FILE_DELAY, pending_file_sync_delay: float = DEFAULT_PENDING_FILE_SYNC_DELAY,
+                                      clock: typing.Callable[[], float] | None = None, hdf5_file_locking: bool = True, close_replace_timeout: float = DEFAULT_CLOSE_REPLACE_TIMEOUT,
                                       close_retry_wait: typing.Callable[[float], None] = time.sleep, stuck_replace_delay: float = DEFAULT_STUCK_REPLACE_DELAY) -> ProjectStorageSystem:
-    return FileProjectStorageSystem(project_path, large_format_size=large_format_size, idle_file_delay=idle_file_delay, clock=clock, hdf5_file_locking=hdf5_file_locking,
+    return FileProjectStorageSystem(project_path, large_format_size=large_format_size, idle_file_delay=idle_file_delay, pending_file_sync_delay=pending_file_sync_delay,
+                                    clock=clock, hdf5_file_locking=hdf5_file_locking,
                                     close_replace_timeout=close_replace_timeout, close_retry_wait=close_retry_wait, stuck_replace_delay=stuck_replace_delay)
 
 
