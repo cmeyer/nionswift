@@ -46,8 +46,11 @@ def main() -> None:
     try:
         hdf5_replace.open_write_project()
         gc.collect()
+        # the measurements run in the script's own order, since each starts from the state the one before leaves.
+        save("rewrite", [hdf5_replace.rewrite("rewrite") for _ in range(arguments.samples)])
         save("reshape", [hdf5_replace.reshape(sample_index, False) for sample_index in range(arguments.samples)])
-        save("rewrite", [hdf5_replace.rewrite() for _ in range(arguments.samples)])
+        save("reshape_held", [hdf5_replace.reshape(arguments.samples + sample_index, True) for sample_index in range(arguments.samples)])
+        save("rewrite_after_reshape", [hdf5_replace.rewrite_after_reshape(2 * arguments.samples + sample_index) for sample_index in range(arguments.samples)])
         hdf5_replace.begin_frames()
         gc.collect()
         save("frame_write", [hdf5_replace.write_frame(frame_index) for frame_index in range(arguments.scan_size ** 2)])
