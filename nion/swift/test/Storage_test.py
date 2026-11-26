@@ -1280,12 +1280,13 @@ class TestStorageClass(unittest.TestCase):
                 data_handle = data_item.data
                 data_item.set_data(numpy.ones((4, 6, 5), numpy.float32))
                 self.assertEqual(2, HDF5Handler.HDF5FileEntry._open_count)
-                # the replaced file stays open while it is held, even when released files are closed.
+                # the replaced file stays open while it is held, even when released files are closed; the new file
+                # closes for its sync.
                 clock_time[0] += 5.0
                 document_model.close_released_files()
-                self.assertEqual(2, HDF5Handler.HDF5FileEntry._open_count)
+                self.assertEqual(1, HDF5Handler.HDF5FileEntry._open_count)
                 data_handle = None
-                # the replaced file closes, and the new file closes as it replaces it.
+                # the replaced file closes, and the new file replaces it.
                 document_model.close_released_files()
                 document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
@@ -1310,13 +1311,14 @@ class TestStorageClass(unittest.TestCase):
                 thread.start()
                 thread.join()
                 self.assertEqual(2, HDF5Handler.HDF5FileEntry._open_count)
-                # the replaced file closes, and the new file closes as it replaces it.
+                # the replaced file closes, and the new file closes for its sync and then replaces it.
                 clock_time[0] += 5.0
                 document_model.close_released_files()
-                self.assertEqual(1, HDF5Handler.HDF5FileEntry._open_count)
+                self.assertEqual(0, HDF5Handler.HDF5FileEntry._open_count)
                 document_model._project.project_storage_system._wait_for_file_syncs()
                 document_model.close_released_files()
                 self.assertEqual(0, HDF5Handler.HDF5FileEntry._open_count)
+                self.assertTrue(numpy.array_equal(numpy.ones((4, 6, 5), numpy.float32), data_item.data))
 
     def test_replaced_hdf5_file_closes_after_its_holder_drops_it_once_the_event_loop_runs_without_a_document_controller(self):
         stored = numpy.random.default_rng(43).random((3, 5, 7)).astype(numpy.float32)

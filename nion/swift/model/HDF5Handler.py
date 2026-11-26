@@ -1364,7 +1364,15 @@ class HDF5Handler(StorageHandler.StorageHandler):
                     self.__pending_file_last_write = (write_generations, self.__deferred_files.get_time())
                 if not self.__deferred_files.is_sync_due(self.__pending_file_last_write[1]):
                     return False
-            self.__file.fp.flush()
+            # a file whose data handle nobody holds is closed first, so that the sync covers what h5py writes as it
+            # closes the file, and the sync thread's open is the first since the writes. on Windows that first open is
+            # slow, and the next use of the file would otherwise wait for it on the main thread.
+            if self.__get_data_handle() is None:
+                self.__dataset = None
+                self.__data_handle_ref = None
+                self.__file.close("syncing")
+            else:
+                self.__file.fp.flush()
             self.__pending_file_sync = (self.__deferred_files.request_sync(self.__current_file_path), write_generations)
             is_requested = True
             if not wait:
