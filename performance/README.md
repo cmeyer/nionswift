@@ -16,6 +16,7 @@ measure a running Nion Swift, and probes, which measure the platform it runs on;
 | `histogram_contention.py` | How long the histogram panel's calculations of one 2048x2048 frame block another thread |
 | `display_data_range.py` | The display's data range of one 2048x2048 frame, and how long it blocks another thread |
 | `thumbnail_reload.py` | Reloading a project from files in a new process until all of its thumbnails are ready |
+| `hdf5_replace.py` | Replacing, rewriting and reserving a 256 MiB HDF5 data item, acquisition frame writes, and loading 100 HDF5 data items |
 
 The comment at the top of each script describes its work and its standard case in more detail.
 
@@ -67,6 +68,8 @@ The statistics of each measurement are:
 - median, the median of its samples;
 - p90, the sample at 90 % of the sorted samples, counting from the fastest;
 - iqr, the interquartile range, from `statistics.quantiles` with its default method, or zero for a single sample.
+
+`hdf5_replace.py` also gives the mean in its report, though not in its rows.
 
 ## Comparing branches
 
