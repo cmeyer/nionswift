@@ -522,6 +522,9 @@ class HDF5DeferredFiles:
         self.__running_sync: HDF5FileSync | None = None
         self.__sync_thread: threading.Thread | None = None
         self.__is_sync_closed = False
+        # whether a sync was requested since the last pass. a pending file closes for its sync, so the request is a change
+        # which the pass reports, whichever caller made it. the condition protects it.
+        self.__is_sync_requested = False
         # the files whose last sync failed with an unexpected error, whose traceback has been printed, until they sync or
         # go. the condition protects them.
         self.__unexpected_error_file_paths: set[pathlib.Path] = set()
@@ -695,6 +698,7 @@ class HDF5DeferredFiles:
             if (sync := self.__sync_requests.get(file_path)) is None:
                 sync = HDF5FileSync(file_path)
                 self.__sync_requests[file_path] = sync
+                self.__is_sync_requested = True
                 if self.__sync_thread is None:
                     self.__sync_thread = threading.Thread(target=self.__sync_files, name="HDF5 file sync", daemon=True)
                     self.__sync_thread.start()
@@ -761,6 +765,9 @@ class HDF5DeferredFiles:
         is_changed = self.__delete_files() or is_changed
         is_changed = self.__move_removed_files() or is_changed
         is_changed = self.__complete_pending_files() or is_changed
+        with self.__sync_condition:
+            is_changed = self.__is_sync_requested or is_changed
+            self.__is_sync_requested = False
         return is_changed
 
     def close(self) -> None:
@@ -1102,7 +1109,8 @@ class HDF5Handler(StorageHandler.StorageHandler):
         self.__storage_deferred_files = deferred_files
         self.__deferred_files = deferred_files if deferred_files is not None else HDF5DeferredFiles()
         # the idle files of its storage system, which close the current file once nobody has used it for a while. a
-        # handler made without them keeps its current file open until it closes or gives it up.
+        # handler made without them keeps its current file open until it closes, gives it up, or requests the sync of a
+        # pending file whose data handle nobody holds.
         self.__idle_files = idle_files
         self._write_count = 0
         HDF5Handler.count += 1
@@ -1365,7 +1373,15 @@ class HDF5Handler(StorageHandler.StorageHandler):
                     self.__pending_file_last_write = (write_generations, self.__deferred_files.get_time())
                 if not self.__deferred_files.is_sync_due(self.__pending_file_last_write[1]):
                     return False
-            self.__file.fp.flush()
+            # a file whose data handle nobody holds is closed first, so that the sync covers what h5py writes as it
+            # closes the file, and the sync thread's open is the first since the writes. on Windows that first open is
+            # slow, and the next use of the file would otherwise wait for it on the main thread.
+            if self.__get_data_handle() is None:
+                self.__dataset = None
+                self.__data_handle_ref = None
+                self.__file.close("syncing")
+            else:
+                self.__file.fp.flush()
             self.__pending_file_sync = (self.__deferred_files.request_sync(self.__current_file_path), write_generations)
             is_requested = True
             if not wait:
