@@ -1,19 +1,22 @@
 """Time acquisition frame writes through the checked out nionswift's HDF5 storage handler and through plain h5py, in several kinds of file.
 
 Usage, from the nionswift clone, with PYTHONPATH set to the clone, at each commit to compare:
-    python windows_handler_probe.py <label>
+    python windows_handler_probe.py <label> [--rounds N]
 Each case makes a new file in the system temporary folder, reserves a 32 x 32 scan of 256 x 256 float32 frames with the
 chunks nionswift gives it, and times the write of each of the 1024 frames, as an acquisition writes them during a
-transaction, which delays the properties. The cases run in turn, three rounds, so that drift affects them alike:
+transaction, which delays the properties. The cases run in turn, three rounds unless --rounds gives another number, so
+that drift affects them alike:
 - handler, item file first: the handler writes the item's properties first, which makes the file with an empty dataset,
   as adding a data item does, and then reserves. On the data-handle branch the reserve goes to a pending file.
 - handler, no item file: the handler reserves into a new file. On the data-handle branch the reserve goes into the item's
   file, without a pending file.
 - h5py, item name: plain h5py, into a file named as a data item's file.
 - h5py, pending name: plain h5py, into a file named as a pending file, with a leading dot.
-It prints the median and mean time of a frame write for each case and round, then removes its files.
+It prints the median and mean time of a frame write for each case and round, and removes each case's files once it is
+done, reporting a pending file which a handler left.
 """
 
+import argparse
 import datetime
 import pathlib
 import platform
@@ -31,7 +34,6 @@ from nion.swift.model import HDF5Handler
 
 SCAN = 32
 FRAME = 256
-ROUNDS = 3
 DATA_SHAPE = (SCAN, SCAN, FRAME, FRAME)
 DATA_DESCRIPTOR = DataAndMetadata.DataDescriptor(False, 2, 2)
 
@@ -76,7 +78,11 @@ def h5py_frames(file_path: pathlib.Path) -> list[float]:
 
 
 def main() -> None:
-    label = sys.argv[1] if len(sys.argv) > 1 else ""
+    parser = argparse.ArgumentParser(description="time frame writes through the HDF5 storage handler and plain h5py")
+    parser.add_argument("label", help="a label for the results, such as a branch name")
+    parser.add_argument("--rounds", type=int, default=3, help="the rounds of the four cases")
+    options = parser.parse_args()
+    label = options.label
     print(f"{label}: python {platform.python_version()}, h5py {h5py.__version__}, HDF5 {h5py.version.hdf5_version}, {sys.platform}, "
           f"chunks {HDF5Handler.get_write_chunk_shape_for_data(DATA_SHAPE, numpy.float32, DATA_DESCRIPTOR)}", flush=True)
     cases: list[tuple[str, typing.Callable[[pathlib.Path, int], list[float]]]] = [
@@ -87,14 +93,17 @@ def main() -> None:
     ]
     with tempfile.TemporaryDirectory() as directory:
         folder = pathlib.Path(directory)
-        for round_index in range(ROUNDS):
+        for round_index in range(options.rounds):
             for name, run in cases:
                 times = run(folder, round_index)
                 print(f"{label}  round {round_index + 1}  {name:26}  median {statistics.median(times) * 1000:.3f} ms  mean {statistics.mean(times) * 1000:.3f} ms",
                       flush=True)
-        files = sorted(path.name for path in folder.iterdir())
-        # a hidden file here is a pending file which a handler left.
-        print(f"{label}: files in the folder before it is removed: {', '.join(files) if files else 'none'}")
+                # each case's files go once it is done, so that the rounds don't fill the disk; a hidden file left by a
+                # handler case is a pending file which the handler didn't complete.
+                for path in sorted(folder.iterdir()):
+                    if name.startswith("handler") and path.name.startswith("."):
+                        print(f"{label}  round {round_index + 1}  {name:26}  left a pending file: {path.name}", flush=True)
+                    path.unlink()
 
 
 if __name__ == "__main__":
